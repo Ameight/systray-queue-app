@@ -1,13 +1,18 @@
-package systray_queue_app
+package main
 
 import (
-	"context"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image"
+	"image/color"
+	"image/draw"
+	"image/png"
 	"io"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -16,7 +21,6 @@ import (
 
 	"github.com/getlantern/systray"
 	"github.com/ncruces/zenity"
-	webview "github.com/webview/webview_go"
 )
 
 // ====== МОДЕЛИ ДАННЫХ ======
@@ -38,9 +42,8 @@ type Task struct {
 }
 
 type taskQueue struct {
-	mu    sync.Mutex
-	Tasks []Task `json:"tasks"`
-
+	mu             sync.Mutex
+	Tasks          []Task `json:"tasks"`
 	filePath       string
 	attachmentsDir string
 }
@@ -53,22 +56,14 @@ func newTaskQueue(baseDir string) (*taskQueue, error) {
 	if err := os.MkdirAll(q.attachmentsDir, 0o755); err != nil {
 		return nil, err
 	}
-	// Загрузка существующей очереди, если есть
-	_ = q.load()
+	if err := q.loadLocked(); err != nil {
+		return nil, err
+	}
 	return q, nil
 }
 
-func (q *taskQueue) save() error {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	b, err := json.MarshalIndent(q, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(q.filePath, b, 0o644)
-}
-
-func (q *taskQueue) load() error {
+// loadLocked читает очередь из файла (если есть). Захватывает лок сам.
+func (q *taskQueue) loadLocked() error {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	b, err := os.ReadFile(q.filePath)
@@ -79,14 +74,33 @@ func (q *taskQueue) load() error {
 		}
 		return err
 	}
-	return json.Unmarshal(b, q)
+	// читаем в временную структуру, затем переносим
+	var tmp struct {
+		Tasks []Task `json:"tasks"`
+	}
+	if err := json.Unmarshal(b, &tmp); err != nil {
+		return err
+	}
+	q.Tasks = tmp.Tasks
+	return nil
+}
+
+// saveLocked пишет текущую очередь на диск. Предполагается, что лок уже удерживается.
+func (q *taskQueue) saveLocked() error {
+	b, err := json.MarshalIndent(struct {
+		Tasks []Task `json:"tasks"`
+	}{Tasks: q.Tasks}, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(q.filePath, b, 0o644)
 }
 
 func (q *taskQueue) enqueue(t Task) error {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.Tasks = append(q.Tasks, t)
-	return q.save()
+	return q.saveLocked()
 }
 
 func (q *taskQueue) peek() (Task, bool) {
@@ -106,7 +120,7 @@ func (q *taskQueue) skip() error {
 	}
 	first := q.Tasks[0]
 	q.Tasks = append(q.Tasks[1:], first)
-	return q.save()
+	return q.saveLocked()
 }
 
 func (q *taskQueue) complete() (Task, error) {
@@ -117,16 +131,18 @@ func (q *taskQueue) complete() (Task, error) {
 	}
 	first := q.Tasks[0]
 	q.Tasks = q.Tasks[1:]
-	if err := q.save(); err != nil {
+	if err := q.saveLocked(); err != nil {
 		return Task{}, err
 	}
 	return first, nil
 }
 
-// ====== ПУТИ ДАННЫХ ======
+// ====== ПУТИ ДАННЫХ / УТИЛИТЫ ======
 
 func appDataDir() (string, error) {
-	// ~/.local/share/appname (Linux), ~/Library/Application Support/appname (macOS), %AppData%\\appname (Windows)
+	// Linux: ~/.config/app
+	// macOS: ~/Library/Application Support/app
+	// Windows: %AppData%\app
 	cfgBase, err := os.UserConfigDir()
 	if err != nil {
 		return "", err
@@ -138,10 +154,57 @@ func appDataDir() (string, error) {
 	return dir, nil
 }
 
+func openWithSystem(path string) error {
+	switch runtime.GOOS {
+	case "darwin":
+		return exec.Command("open", path).Start()
+	case "windows":
+		return exec.Command("rundll32", "url.dll,FileProtocolHandler", path).Start()
+	default:
+		return exec.Command("xdg-open", path).Start()
+	}
+}
+
+func copyFile(src, dst string) error {
+	s, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+	d, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	_, err = io.Copy(d, s)
+	return err
+}
+
+// makeTemplateIcon генерирует простую монохромную PNG-иконку 16x16 (подходит как template для macOS).
+func makeTemplateIcon() []byte {
+	img := image.NewRGBA(image.Rect(0, 0, 16, 16))
+	// прозрачный фон
+	draw.Draw(img, img.Bounds(), &image.Uniform{C: color.RGBA{0, 0, 0, 0}}, image.Point{}, draw.Src)
+	// чёрный кружок в центре
+	fg := color.RGBA{0, 0, 0, 255}
+	cx, cy, r := 8, 8, 4
+	for y := 0; y < 16; y++ {
+		for x := 0; x < 16; x++ {
+			dx, dy := x-cx, y-cy
+			if dx*dx+dy*dy <= r*r {
+				img.Set(x, y, fg)
+			}
+		}
+	}
+	var buf bytes.Buffer
+	_ = png.Encode(&buf, img)
+	return buf.Bytes()
+}
+
 // ====== UI ДИАЛОГИ ======
 
 func showAddTaskDialog(q *taskQueue) {
-	// 1) Ввод текста задачи
+	// Ввод текста
 	text, err := zenity.Entry(
 		"Введите текст задачи:",
 		zenity.Title("Добавить задачу"),
@@ -157,13 +220,14 @@ func showAddTaskDialog(q *taskQueue) {
 		return
 	}
 
-	// 2) Выбор вложения (необязательно)
+	// Выбор вложения (необязательно)
 	var attachPath string
 	var aType AttachmentType = AttachmentNone
 	if err := zenity.Question(
 		"Хотите прикрепить файл? (PNG/JPG/M4A/MP3)",
 		zenity.Title("Вложение"),
-		zenity.OKLabel("Да"), zenity.CancelLabel("Нет"),
+		zenity.OKLabel("Да"),
+		zenity.CancelLabel("Нет"),
 	); err == nil {
 		filters := []zenity.FileFilter{
 			{Name: "Изображения (PNG/JPG)", Patterns: []string{"*.png", "*.jpg", "*.jpeg"}},
@@ -171,21 +235,20 @@ func showAddTaskDialog(q *taskQueue) {
 		}
 		fp, ferr := zenity.SelectFile(
 			zenity.Title("Выберите файл"),
-			zenity.FileFilters(filters...),
+			zenity.FileFilters(filters),
 		)
 		if ferr == nil && fp != "" {
 			attachPath = fp
 			ext := strings.ToLower(filepath.Ext(fp))
 			if ext == ".png" || ext == ".jpg" || ext == ".jpeg" {
 				aType = AttachmentImage
-			}
-			if ext == ".m4a" || ext == ".mp3" {
+			} else if ext == ".m4a" || ext == ".mp3" {
 				aType = AttachmentAudio
 			}
 		}
 	}
 
-	// 3) Копируем вложение в каталог приложения
+	// Копируем вложение в каталог приложения
 	var storedPath string
 	if attachPath != "" {
 		base := fmt.Sprintf("%d_%s", time.Now().UnixNano(), filepath.Base(attachPath))
@@ -197,7 +260,7 @@ func showAddTaskDialog(q *taskQueue) {
 		storedPath = dst
 	}
 
-	// 4) Сохраняем задачу
+	// Сохраняем задачу
 	t := Task{
 		ID:             fmt.Sprintf("tsk_%d", time.Now().UnixNano()),
 		Text:           text,
@@ -219,93 +282,34 @@ func showFirstTaskDialog(q *taskQueue) {
 		return
 	}
 
-	// Рендерим мини-диалог в webview (только чтение + предпросмотр)
-	html := buildTaskHTML(t)
-	w := webview.New(true)
-	defer w.Destroy()
-	w.SetTitle("Первая задача")
-	w.SetSize(520, 420, webview.HintNone)
-	w.Navigate("data:text/html," + urlEncodeHTML(html))
-	w.Run()
-}
-
-func buildTaskHTML(t Task) string {
-	var b strings.Builder
-	b.WriteString("<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n")
-	b.WriteString("<style>body{font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;padding:16px;line-height:1.45} .box{border:1px solid #ddd;border-radius:12px;padding:12px} .muted{color:#666;font-size:12px} img{max-width:100%;height:auto;border-radius:8px;border:1px solid #ccc} audio{width:100%;margin-top:8px}</style></head><body>")
-	b.WriteString("<h3>Первая задача</h3>")
-	b.WriteString("<div class=box>")
-	b.WriteString("<div class=muted>" + t.CreatedAt.Format("2006-01-02 15:04:05") + "</div>")
-	b.WriteString("<p>" + htmlEscape(t.Text) + "</p>")
-	if t.AttachmentPath != "" {
-		p := pathToFileURL(t.AttachmentPath)
-		switch t.AttachmentType {
-		case AttachmentImage:
-			b.WriteString("<img src=\"" + p + "\" alt=\"attachment\">")
-		case AttachmentAudio:
-			b.WriteString("<audio controls src=\"" + p + "\"></audio>")
-		}
+	msg := t.Text
+	switch t.AttachmentType {
+	case AttachmentImage:
+		msg += "\n\nВложение: изображение (можно открыть для просмотра)"
+	case AttachmentAudio:
+		msg += "\n\nВложение: аудио (можно воспроизвести системным плеером)"
 	}
-	b.WriteString("</div>")
-	b.WriteString("<p class=muted>Закройте окно, чтобы вернуться в меню трея.\nИспользуйте пункты меню \"Пропустить\" или \"Завершить\" для управления очередью.</p>")
-	b.WriteString("</body></html>")
-	return b.String()
-}
 
-func pathToFileURL(p string) string {
-	p = filepath.ToSlash(p)
-	if strings.HasPrefix(p, "/") {
-		return "file://" + p
-	}
-	// Windows
-	if len(p) >= 2 && p[1] == ':' {
-		return "file:///" + p
-	}
-	return p
-}
-
-func htmlEscape(s string) string {
-	replacer := strings.NewReplacer(
-		"&", "&amp;",
-		"<", "&lt;",
-		">", "&gt;",
-		"\"", "&quot;",
-		"'", "&#39;",
+	err := zenity.Question(
+		msg,
+		zenity.Title("Первая задача"),
+		zenity.OKLabel("Ок"),
+		zenity.ExtraButton("Открыть вложение"),
 	)
-	return replacer.Replace(s)
-}
 
-func urlEncodeHTML(s string) string {
-	// Простая percent-encode для data: URL
-	var b strings.Builder
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || strings.ContainsRune("-_.~:/?&=;,+#% ", rune(c)) {
-			if c == ' ' {
-				b.WriteString("%20")
-			} else {
-				b.WriteByte(c)
-			}
-		} else {
-			b.WriteString(fmt.Sprintf("%%%02X", c))
+	switch {
+	case err == nil:
+		// Нажата “Ок” — просто закрываем диалог
+	case errors.Is(err, zenity.ErrExtraButton):
+		// Нажато “Открыть вложение”
+		if t.AttachmentPath != "" {
+			_ = openWithSystem(t.AttachmentPath)
 		}
+	case errors.Is(err, zenity.ErrCanceled):
+		// Окно закрыли крестиком — ничего не делаем
+	default:
+		_ = zenity.Error(fmt.Sprintf("Ошибка диалога: %v", err), zenity.Title("Ошибка"))
 	}
-	return b.String()
-}
-
-func copyFile(src, dst string) error {
-	s, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer s.Close()
-	d, err := os.Create(dst)
-	if err != nil {
-		return err
-	}
-	defer d.Close()
-	_, err = io.Copy(d, s)
-	return err
 }
 
 // ====== ТРЕЙ ======
@@ -321,9 +325,9 @@ func onReady() {
 		log.Fatal(err)
 	}
 
-	// Иконка (необязательно). Для macOS можно использовать монохромный template PNG.
-	// systray.SetTemplateIcon(iconTemplatePNG, iconTemplatePNG) // TODO: подставьте свои байты PNG
-	// systray.SetIcon(iconRegularICOorPNG)                      // Windows/Linux
+	// Ставим простую монохромную template-иконку, сгенерированную на лету
+	icon := makeTemplateIcon()
+	systray.SetTemplateIcon(icon, icon)
 
 	systray.SetTitle("Tasks")
 	systray.SetTooltip("Очередь задач")
@@ -337,7 +341,6 @@ func onReady() {
 
 	// Обновление динамического тултипа с количеством
 	updateTooltip := func() {
-		// читаем без гонок
 		q.mu.Lock()
 		n := len(q.Tasks)
 		q.mu.Unlock()
@@ -372,14 +375,11 @@ func onReady() {
 }
 
 func onExit() {
-	// Освобождение ресурсов при выходе, если нужно
+	// Освобождение ресурсов при выходе (если понадобится)
 }
 
 func main() {
-	// На macOS скрываем док-иконку при запуске вне .app — это делается plist-ом в сборке .app.
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	_ = ctx
-
+	// macOS: systray.Run должен быть вызван на главном OS-потоке
+	runtime.LockOSThread()
 	systray.Run(onReady, onExit)
 }
