@@ -4,8 +4,3 @@ export GOPROXY=https://proxy.golang.org
 build-win:
 	go build -ldflags="-H=windowsgui" -o systray-queue-app.exe
 
-
-go mod tidy
-
-# Сборка обычного бинаря
-go build -o systray-queue-app
