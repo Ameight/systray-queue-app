@@ -1,0 +1,22 @@
+version: 1
+
+hotkeys:
+  show_first:
+    enabled: true
+    combo: "ctrl+alt+q"
+
+  add_from_clipboard:
+    enabled: true
+    combo: "ctrl+alt+a"
+
+  skip:
+    enabled: true
+    combo: "ctrl+alt+s"
+
+  complete:
+    enabled: true
+    combo: "ctrl+alt+d"
+
+  manage_queue:
+    enabled: true
+    combo: "ctrl+alt+m"

@@ -11,16 +11,22 @@ import (
 	"image/png"
 	"io"
 	"log"
+	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/microcosm-cc/bluemonday"
 	webview "github.com/webview/webview_go"
+	"golang.design/x/hotkey"
+	"gopkg.in/yaml.v3"
 
 	"github.com/getlantern/systray"
 	"github.com/ncruces/zenity"
@@ -98,13 +104,11 @@ func (q *taskQueue) loadLocked() error {
 }
 
 func (q *taskQueue) saveLocked() error {
-	b, err := json.MarshalIndent(struct {
-		Tasks []Task `json:"tasks"`
-	}{Tasks: q.Tasks}, "", "  ")
+	data, err := json.MarshalIndent(q, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(q.filePath, b, 0o644)
+	return atomicWriteFile(q.filePath, data, 0644)
 }
 
 func (q *taskQueue) enqueue(t Task) error {
@@ -146,15 +150,27 @@ func (q *taskQueue) skip() error {
 func (q *taskQueue) complete() (Task, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
+
 	if len(q.Tasks) == 0 {
-		return Task{}, errors.New("queue is empty")
+		return Task{}, nil
 	}
-	first := q.Tasks[0]
+
+	task := q.Tasks[0]
 	q.Tasks = q.Tasks[1:]
+
 	if err := q.saveLocked(); err != nil {
 		return Task{}, err
 	}
-	return first, nil
+
+	// Удаляем вложение после успешного сохранения очереди
+	if task.AttachmentPath != "" && q.attachmentsDir != "" {
+		inside, err := isPathInsideDir(task.AttachmentPath, q.attachmentsDir)
+		if err == nil && inside {
+			_ = os.Remove(task.AttachmentPath) // мягко: не валим операцию, если файла уже нет
+		}
+	}
+
+	return task, nil
 }
 
 /* =======================
@@ -417,32 +433,6 @@ func showAddTaskDialog(q *taskQueue) {
 
 }
 
-func showFirstTaskDialogOld(q *taskQueue) {
-	t, ok := q.peek()
-	if !ok {
-		_ = zenity.Info("Очередь пуста", zenity.Title("Задачи"))
-		return
-	}
-
-	audio := ""
-	if t.AttachmentType == AttachmentAudio && t.AttachmentPath != "" {
-		audio = t.AttachmentPath
-	}
-	htmlPath, err := renderMarkdownToTempHTML(t.Text, audio)
-	if err != nil {
-		_ = zenity.Error(fmt.Sprintf("Ошибка рендера Markdown: %v", err), zenity.Title("Ошибка"))
-		return
-	}
-
-	// webview обязательно в main thread!
-	w := webview.New(false)
-	defer w.Destroy()
-	w.SetTitle("Первая задача")
-	w.SetSize(800, 600, webview.HintNone)
-	w.Navigate("file://" + htmlPath)
-	w.Run()
-}
-
 func showFirstTaskDialog(q *taskQueue) {
 	t, ok := q.peek()
 	if !ok {
@@ -477,6 +467,12 @@ func onReady() {
 		log.Fatal(err)
 	}
 
+	keyCfgPath := filepath.Join(baseDir, "key-config.yaml")
+	keyCfg, err := loadOrCreateKeyConfig(keyCfgPath)
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	icon := makeTemplateIcon()
 	systray.SetTemplateIcon(icon, icon)
 	systray.SetTitle("Tasks")
@@ -488,6 +484,7 @@ func onReady() {
 	mSkip := systray.AddMenuItem("Пропустить задачу", "Переместить первую задачу в конец")
 	mDone := systray.AddMenuItem("Завершить задачу", "Удалить первую задачу")
 	mList := systray.AddMenuItem("Все задачи…", "Посмотреть и изменить порядок")
+	mManage := systray.AddMenuItem("Поменять порядок…", "Поменять порядок drag & drop")
 
 	// Настройки
 	systray.AddSeparator()
@@ -542,6 +539,15 @@ func onReady() {
 				showAllTasksDialog(q)
 				// по желанию: обновить тултип (кол-во не меняется, но порядок — да)
 				// updateTooltip()
+			case <-mManage.ClickedCh:
+				manageOnce.Do(func() {
+					manageURL, manageErr = startManageServer(q)
+				})
+				if manageErr != nil {
+					_ = zenity.Error(fmt.Sprintf("Failed to start manage UI: %v", manageErr), zenity.Title("Error"))
+					break
+				}
+				_ = openBrowser(manageURL)
 
 			case <-mQuit.ClickedCh:
 				systray.Quit()
@@ -712,7 +718,7 @@ func renderMarkdownToTempHTML(md string, maybeAudioPath string) (string, error) 
  pre,code{background:#f6f8fa}
  audio{width:100%;margin:8px 0}
 </style>
-</head><body>` + out.String() + `</body></html>`
+</head><body>` + sanitizeTaskHTML(out.String()) + `</body></html>`
 
 	baseDir, err := appDataDir()
 	if err != nil {
@@ -842,4 +848,562 @@ func parseMove(s string) (int, int, error) {
 		return 0, 0, fmt.Errorf("indexes must be >= 1")
 	}
 	return a, b, nil
+}
+
+func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	base := filepath.Base(path)
+
+	tmp, err := os.CreateTemp(dir, base+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+
+	// На всякий случай: если что-то пойдёт не так — уберём tmp
+	defer func() {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+	}()
+
+	if err := tmp.Chmod(perm); err != nil {
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+
+	// Rename поверх целевого файла
+	if err := os.Rename(tmpName, path); err != nil {
+		return err
+	}
+
+	// Максимальная надёжность: sync директории (актуально на Unix)
+	if d, err := os.Open(dir); err == nil {
+		_ = d.Sync()
+		_ = d.Close()
+	}
+	return nil
+}
+
+func fileURLFromPath(p string) (string, error) {
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		return "", err
+	}
+
+	// URL-path всегда со слэшами
+	upath := filepath.ToSlash(abs)
+
+	// На Windows нужно /C:/...
+	if runtime.GOOS == "windows" {
+		if len(upath) >= 2 && upath[1] == ':' {
+			upath = "/" + upath
+		}
+	}
+
+	u := url.URL{
+		Scheme: "file",
+		Path:   upath,
+	}
+	return u.String(), nil
+}
+
+func isPathInsideDir(filePath, dir string) (bool, error) {
+	absFile, err := filepath.Abs(filePath)
+	if err != nil {
+		return false, err
+	}
+	absDir, err := filepath.Abs(dir)
+	if err != nil {
+		return false, err
+	}
+
+	rel, err := filepath.Rel(absDir, absFile)
+	if err != nil {
+		return false, err
+	}
+
+	// rel не должен начинаться с ".." и не должен быть абсолютным
+	if rel == "." {
+		// файл = директория — нам не подходит
+		return false, nil
+	}
+	if strings.HasPrefix(rel, ".."+string(os.PathSeparator)) || rel == ".." || filepath.IsAbs(rel) {
+		return false, nil
+	}
+	return true, nil
+}
+
+func sanitizeTaskHTML(htmlStr string) string {
+	p := bluemonday.UGCPolicy()
+
+	// Разрешаем то, что тебе реально нужно:
+	// - audio с controls, src
+	// - source для audio
+	p.AllowElements("audio", "source")
+	p.AllowAttrs("controls").OnElements("audio")
+	p.AllowAttrs("src").OnElements("audio", "source")
+	p.AllowAttrs("type").OnElements("source")
+
+	// Разрешаем img и src (иначе markdown-картинки могут сломаться в некоторых политиках)
+	p.AllowElements("img")
+	p.AllowAttrs("src", "alt", "title").OnElements("img")
+
+	// Разрешаем file: ссылки для локальных вложений
+	p.AllowURLSchemes("http", "https", "mailto", "file")
+
+	return p.Sanitize(htmlStr)
+}
+
+func (q *taskQueue) reorderByIndicesLocked(order []int) error {
+	n := len(q.Tasks)
+	if len(order) != n {
+		return fmt.Errorf("bad order length: got %d want %d", len(order), n)
+	}
+
+	seen := make([]bool, n)
+	newTasks := make([]Task, n)
+
+	for i, idx := range order {
+		if idx < 0 || idx >= n {
+			return fmt.Errorf("index out of range: %d", idx)
+		}
+		if seen[idx] {
+			return fmt.Errorf("duplicate index: %d", idx)
+		}
+		seen[idx] = true
+		newTasks[i] = q.Tasks[idx]
+	}
+
+	q.Tasks = newTasks
+	return q.saveLocked()
+}
+
+func (q *taskQueue) reorderByIndices(order []int) error {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.reorderByIndicesLocked(order)
+}
+
+var (
+	manageOnce sync.Once
+	manageURL  string
+	manageErr  error
+)
+
+func openBrowser(url string) error {
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "darwin":
+		cmd = exec.Command("open", url)
+	case "windows":
+		cmd = exec.Command("rundll32", "url.dll,FileProtocolHandler", url)
+	default:
+		cmd = exec.Command("xdg-open", url)
+	}
+	return cmd.Start()
+}
+
+func startManageServer(q *taskQueue) (string, error) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0") // случайный свободный порт
+	if err != nil {
+		return "", err
+	}
+
+	mux := http.NewServeMux()
+
+	// HTML страница
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		// Берём снэпшот задач под lock
+		q.mu.Lock()
+		tasks := make([]Task, len(q.Tasks))
+		copy(tasks, q.Tasks)
+		q.mu.Unlock()
+
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		io.WriteString(w, renderManageHTML(tasks))
+	})
+
+	// Принять новый порядок
+	mux.HandleFunc("/reorder", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			Order []int `json:"order"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "bad json", http.StatusBadRequest)
+			return
+		}
+
+		// Минимальная валидация (сортировка копии для проверки permutation)
+		ord := append([]int(nil), req.Order...)
+		sort.Ints(ord)
+		for i := range ord {
+			if ord[i] != i {
+				http.Error(w, "bad permutation", http.StatusBadRequest)
+				return
+			}
+		}
+
+		if err := q.reorderByIndices(req.Order); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		io.WriteString(w, `{"ok":true}`)
+	})
+
+	srv := &http.Server{
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+
+	go func() {
+		_ = srv.Serve(ln)
+	}()
+
+	url := "http://" + ln.Addr().String() + "/"
+	return url, nil
+}
+
+func renderManageHTML(tasks []Task) string {
+	// ВАЖНО: мы не вставляем сырой task.Text в HTML напрямую (там может быть что угодно).
+	// Для простоты показываем короткий превью-текст в текстовом узле через JS-эскейп? —
+	// Тут проще: рендерим сервером только data-idx, а текст экранируем очень грубо.
+	esc := func(s string) string {
+		s = strings.ReplaceAll(s, "&", "&amp;")
+		s = strings.ReplaceAll(s, "<", "&lt;")
+		s = strings.ReplaceAll(s, ">", "&gt;")
+		s = strings.ReplaceAll(s, `"`, "&quot;")
+		return s
+	}
+
+	var b strings.Builder
+	b.WriteString(`<!doctype html><html><head><meta charset="utf-8">`)
+	b.WriteString(`<meta name="viewport" content="width=device-width, initial-scale=1">`)
+	b.WriteString(`<title>Manage queue</title>`)
+	b.WriteString(`<style>
+        body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,Noto Sans,sans-serif;margin:20px;max-width:900px}
+        h1{font-size:20px;margin:0 0 12px}
+        .row{display:flex;gap:10px;align-items:center;margin:12px 0}
+        button{padding:8px 12px;border-radius:8px;border:1px solid #ccc;background:#fff;cursor:pointer}
+        button:hover{background:#f5f5f5}
+        #status{font-size:12px;color:#666}
+        ul{list-style:none;padding:0;margin:0;border:1px solid #ddd;border-radius:12px;overflow:hidden}
+        li{padding:10px 12px;border-bottom:1px solid #eee;cursor:grab;background:#fff}
+        li:last-child{border-bottom:none}
+        li.dragging{opacity:.5}
+        li.over{outline:2px dashed #999;outline-offset:-2px}
+        .hint{font-size:12px;color:#666;margin-top:10px}
+    </style></head><body>`)
+	b.WriteString(`<h1>Manage queue</h1>`)
+	b.WriteString(`<div class="row"><button id="save">Save</button><span id="status"></span></div>`)
+	b.WriteString(`<ul id="list">`)
+
+	for i, t := range tasks {
+		// показываем превью первой строки
+		prev := t.Text
+		if idx := strings.IndexByte(prev, '\n'); idx >= 0 {
+			prev = prev[:idx]
+		}
+		if len(prev) > 140 {
+			prev = prev[:140] + "…"
+		}
+		b.WriteString(fmt.Sprintf(`<li draggable="true" data-idx="%d">%d. %s</li>`, i, i+1, esc(prev)))
+	}
+
+	b.WriteString(`</ul>`)
+	b.WriteString(`<div class="hint">Drag tasks to reorder. Click Save to persist.</div>`)
+
+	b.WriteString(`<script>
+        const list = document.getElementById('list');
+        const status = document.getElementById('status');
+        let dragging = null;
+
+        function setStatus(msg){ status.textContent = msg || ''; }
+
+        list.addEventListener('dragstart', (e) => {
+            const li = e.target.closest('li');
+            if (!li) return;
+            dragging = li;
+            li.classList.add('dragging');
+            e.dataTransfer.effectAllowed = 'move';
+            // для Firefox нужно data
+            e.dataTransfer.setData('text/plain', li.dataset.idx);
+        });
+
+        list.addEventListener('dragend', (e) => {
+            const li = e.target.closest('li');
+            if (!li) return;
+            li.classList.remove('dragging');
+            [...list.querySelectorAll('li.over')].forEach(x => x.classList.remove('over'));
+            dragging = null;
+        });
+
+        list.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            const over = e.target.closest('li');
+            if (!over || !dragging || over === dragging) return;
+            over.classList.add('over');
+
+            const rect = over.getBoundingClientRect();
+            const before = (e.clientY - rect.top) < rect.height / 2;
+            if (before) {
+                list.insertBefore(dragging, over);
+            } else {
+                list.insertBefore(dragging, over.nextSibling);
+            }
+        });
+
+        list.addEventListener('dragleave', (e) => {
+            const li = e.target.closest('li');
+            if (li) li.classList.remove('over');
+        });
+
+        document.getElementById('save').addEventListener('click', async () => {
+            const order = [...list.querySelectorAll('li')].map(li => parseInt(li.dataset.idx, 10));
+            setStatus('Saving…');
+            try {
+                const res = await fetch('/reorder', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({order})
+                });
+                if (!res.ok) throw new Error(await res.text());
+                setStatus('Saved');
+                setTimeout(()=>setStatus(''), 1200);
+            } catch (err) {
+                setStatus('Error: ' + err.message);
+            }
+        });
+    </script>`)
+
+	b.WriteString(`</body></html>`)
+	return b.String()
+}
+
+type HotkeyConfig struct {
+	Enabled bool   `yaml:"enabled"`
+	Combo   string `yaml:"combo"`
+}
+
+type KeyConfig struct {
+	Version int                     `yaml:"version"`
+	Hotkeys map[string]HotkeyConfig `yaml:"hotkeys"`
+}
+
+func defaultKeyConfig() KeyConfig {
+	return KeyConfig{
+		Version: 1,
+		Hotkeys: map[string]HotkeyConfig{
+			"show_first":         {Enabled: true, Combo: "ctrl+alt+q"},
+			"add_from_clipboard": {Enabled: true, Combo: "ctrl+alt+a"},
+			"skip":               {Enabled: true, Combo: "ctrl+alt+s"},
+			"complete":           {Enabled: true, Combo: "ctrl+alt+d"},
+			"manage_queue":       {Enabled: true, Combo: "ctrl+alt+m"},
+		},
+	}
+}
+
+func loadOrCreateKeyConfig(path string) (KeyConfig, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			cfg := defaultKeyConfig()
+			out, _ := yaml.Marshal(cfg)
+			if err := atomicWriteFile(path, out, 0644); err != nil {
+				return KeyConfig{}, err
+			}
+			return cfg, nil
+		}
+		return KeyConfig{}, err
+	}
+
+	var cfg KeyConfig
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return KeyConfig{}, fmt.Errorf("failed to parse key-config.yaml: %w", err)
+	}
+	if cfg.Version == 0 {
+		cfg.Version = 1
+	}
+	if cfg.Hotkeys == nil {
+		cfg.Hotkeys = map[string]HotkeyConfig{}
+	}
+	return cfg, nil
+}
+
+func parseHotkeyCombo(combo string) ([]hotkey.Modifier, hotkey.Key, error) {
+	parts := strings.Split(strings.ToLower(strings.TrimSpace(combo)), "+")
+	if len(parts) == 0 {
+		return nil, 0, fmt.Errorf("empty combo")
+	}
+
+	var mods []hotkey.Modifier
+	// Последний токен считаем "основной клавишей"
+	keyToken := strings.TrimSpace(parts[len(parts)-1])
+	modTokens := parts[:len(parts)-1]
+
+	for _, mt := range modTokens {
+		mt = strings.TrimSpace(mt)
+		switch mt {
+		case "ctrl", "control":
+			mods = append(mods, hotkey.ModCtrl)
+		case "alt", "option":
+			mods = append(mods, hotkey.ModAlt)
+		case "shift":
+			mods = append(mods, hotkey.ModShift)
+		case "cmd", "command", "meta", "super", "win":
+			mods = append(mods, hotkey.ModCmd)
+		default:
+			return nil, 0, fmt.Errorf("unknown modifier: %s", mt)
+		}
+	}
+
+	// Клавиша
+	if k, ok := parseKeyToken(keyToken); ok {
+		return mods, k, nil
+	}
+	return nil, 0, fmt.Errorf("unknown key: %s", keyToken)
+}
+
+func parseKeyToken(t string) (hotkey.Key, bool) {
+	// Буквы
+	if len(t) == 1 && t[0] >= 'a' && t[0] <= 'z' {
+		return hotkey.Key(t[0] - 'a' + byte(hotkey.KeyA)), true
+	}
+	// Цифры
+	if len(t) == 1 && t[0] >= '0' && t[0] <= '9' {
+		// В hotkey обычно есть Key0..Key9, но на всякий — можно расширить позже.
+		switch t[0] {
+		case '0':
+			return hotkey.Key0, true
+		case '1':
+			return hotkey.Key1, true
+		case '2':
+			return hotkey.Key2, true
+		case '3':
+			return hotkey.Key3, true
+		case '4':
+			return hotkey.Key4, true
+		case '5':
+			return hotkey.Key5, true
+		case '6':
+			return hotkey.Key6, true
+		case '7':
+			return hotkey.Key7, true
+		case '8':
+			return hotkey.Key8, true
+		case '9':
+			return hotkey.Key9, true
+		}
+	}
+
+	switch t {
+	case "space":
+		return hotkey.KeySpace, true
+	case "enter", "return":
+		return hotkey.KeyReturn, true
+	case "tab":
+		return hotkey.KeyTab, true
+	case "esc", "escape":
+		return hotkey.KeyEscape, true
+	}
+
+	// F1..F12
+	if strings.HasPrefix(t, "f") {
+		n, err := strconv.Atoi(strings.TrimPrefix(t, "f"))
+		if err == nil {
+			switch n {
+			case 1:
+				return hotkey.KeyF1, true
+			case 2:
+				return hotkey.KeyF2, true
+			case 3:
+				return hotkey.KeyF3, true
+			case 4:
+				return hotkey.KeyF4, true
+			case 5:
+				return hotkey.KeyF5, true
+			case 6:
+				return hotkey.KeyF6, true
+			case 7:
+				return hotkey.KeyF7, true
+			case 8:
+				return hotkey.KeyF8, true
+			case 9:
+				return hotkey.KeyF9, true
+			case 10:
+				return hotkey.KeyF10, true
+			case 11:
+				return hotkey.KeyF11, true
+			case 12:
+				return hotkey.KeyF12, true
+			}
+		}
+	}
+
+	return 0, false
+}
+
+type registeredHotkey struct {
+	Action string
+	HK     *hotkey.Hotkey
+}
+
+func registerHotkeys(cfg KeyConfig, actionFn map[string]func()) ([]registeredHotkey, error) {
+	var regs []registeredHotkey
+
+	for action, hc := range cfg.Hotkeys {
+		if !hc.Enabled {
+			continue
+		}
+		fn, ok := actionFn[action]
+		if !ok {
+			// неизвестный action — пропускаем (или можно вернуть ошибку)
+			continue
+		}
+
+		mods, key, err := parseHotkeyCombo(hc.Combo)
+		if err != nil {
+			return nil, fmt.Errorf("hotkey %s (%q): %w", action, hc.Combo, err)
+		}
+
+		hk := hotkey.New(mods, key)
+		if err := hk.Register(); err != nil {
+			return nil, fmt.Errorf("failed to register hotkey %s (%q): %w", action, hc.Combo, err)
+		}
+
+		regs = append(regs, registeredHotkey{Action: action, HK: hk})
+
+		// слушаем нажатия
+		go func(fn func(), hk *hotkey.Hotkey) {
+			for range hk.Keydown() {
+				fn()
+			}
+		}(fn, hk)
+	}
+
+	return regs, nil
+}
+
+func unregisterHotkeys(regs []registeredHotkey) {
+	for _, r := range regs {
+		_ = r.HK.Unregister()
+	}
 }
