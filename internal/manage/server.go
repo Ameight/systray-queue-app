@@ -75,6 +75,7 @@ func (s *Server) start() (string, error) {
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	go func() { _ = srv.Serve(ln) }()
+	go preloadWhisperModel()
 
 	return "http://" + ln.Addr().String() + "/", nil
 }
@@ -587,6 +588,46 @@ func (s *Server) handleTranscribe(w http.ResponseWriter, r *http.Request) {
 	w.Write(data)
 }
 
+// preloadWhisperModel downloads the whisper model in the background at startup
+// so the first transcription does not stall waiting for a download.
+func preloadWhisperModel() {
+	whisperBin, err := exec.LookPath("whisper")
+	if err != nil {
+		return // whisper not installed — nothing to preload
+	}
+
+	// Feed whisper a minimal valid WAV (44-byte header, 0 audio samples).
+	// Whisper will load (and cache) the model, then fail on the empty audio — that's fine.
+	tmp, err := os.CreateTemp("", "whisper-preload-*.wav")
+	if err != nil {
+		return
+	}
+	defer os.Remove(tmp.Name())
+
+	// Minimal RIFF/WAV header: PCM, 1 ch, 16 kHz, 16-bit, 0 samples.
+	wav := []byte{
+		'R', 'I', 'F', 'F', 36, 0, 0, 0, // RIFF chunk size = 36
+		'W', 'A', 'V', 'E',
+		'f', 'm', 't', ' ', 16, 0, 0, 0, // fmt chunk, 16 bytes
+		1, 0, // PCM
+		1, 0, // mono
+		0x80, 0x3E, 0, 0, // 16000 Hz
+		0, 0x7D, 0, 0, // byte rate = 32000
+		2, 0, // block align
+		16, 0, // bits per sample
+		'd', 'a', 't', 'a', 0, 0, 0, 0, // data chunk, 0 bytes
+	}
+	tmp.Write(wav)
+	tmp.Close()
+
+	cmd := exec.Command(whisperBin, tmp.Name(), "--model", whisperModel, "--output_format", "txt", "--output_dir", os.TempDir())
+	_ = cmd.Run() // errors expected (empty audio); model is cached after this
+}
+
+// whisperModel is the default model used for transcription.
+// "tiny" (~39 MB) downloads fast; change to "small" or "base" for better accuracy.
+const whisperModel = "tiny"
+
 // transcribeAudio runs the whisper CLI on audioPath and returns the transcribed text.
 func transcribeAudio(audioPath string) (string, error) {
 	whisperBin, err := exec.LookPath("whisper")
@@ -594,10 +635,10 @@ func transcribeAudio(audioPath string) (string, error) {
 		return "", fmt.Errorf("whisper not found in PATH (install with: pip install openai-whisper)")
 	}
 	outDir := filepath.Dir(audioPath)
-	// whisper <file> --output_format txt --output_dir <dir>
-	cmd := exec.Command(whisperBin, audioPath, "--output_format", "txt", "--output_dir", outDir)
+	// whisper <file> --model tiny --output_format txt --output_dir <dir>
+	cmd := exec.Command(whisperBin, audioPath, "--model", whisperModel, "--output_format", "txt", "--output_dir", outDir)
 	if out, err := cmd.CombinedOutput(); err != nil {
-		return "", fmt.Errorf("whisper error: %w\n%s", err, string(out))
+		return "", fmt.Errorf("whisper error: %w\n%s\n\nTip: run 'whisper --model %s /dev/null' once to pre-download the model", err, string(out), whisperModel)
 	}
 	// Whisper writes <basename>.txt next to the audio file.
 	base := strings.TrimSuffix(filepath.Base(audioPath), filepath.Ext(audioPath))
