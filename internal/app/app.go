@@ -66,11 +66,11 @@ func onReady() {
 	updateTooltip()
 
 	actions := map[string]func(){
-		"show_first":         func() { _ = openURL("/view") },
-		"manage_queue":       func() { _ = openURL("/") },
-		"add_from_clipboard": func() { _ = openURL("/add") },
-		"skip":               func() { _ = q.Skip(); updateTooltip() },
-		"complete":           func() { _, _ = q.Complete(); updateTooltip() },
+		hotkeys.ActionShowFirst:        func() { _ = openURL("/view") },
+		hotkeys.ActionManageQueue:      func() { _ = openURL("/") },
+		hotkeys.ActionAddFromClipboard: func() { _ = openURL("/add") },
+		hotkeys.ActionSkip:             func() { _ = q.Skip(); updateTooltip() },
+		hotkeys.ActionComplete:         func() { _, _ = q.Complete(); updateTooltip() },
 	}
 
 	// menuHotkeys maps hotkey action → menu item tooltip base text.
@@ -81,11 +81,11 @@ func onReady() {
 		action  string
 	}
 	hotkeyMenuItems := []menuItem{
-		{mView, "Open current task in browser", "show_first"},
-		{mAddAdvanced, "Open advanced editor in browser", "add_from_clipboard"},
-		{mSkip, "Move current task to the end", "skip"},
-		{mDone, "Complete current task", "complete"},
-		{mManage, "Reorder tasks", "manage_queue"},
+		{mView, "Open current task in browser", hotkeys.ActionShowFirst},
+		{mAddAdvanced, "Open advanced editor in browser", hotkeys.ActionAddFromClipboard},
+		{mSkip, "Move current task to the end", hotkeys.ActionSkip},
+		{mDone, "Complete current task", hotkeys.ActionComplete},
+		{mManage, "Reorder tasks", hotkeys.ActionManageQueue},
 	}
 
 	applyTooltips := func(cfg hotkeys.KeyConfig) {

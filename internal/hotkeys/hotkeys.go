@@ -14,6 +14,15 @@ import (
 	"github.com/Ameight/systray-queue-app/internal/util"
 )
 
+// Action keys — used as identifiers in key-config.yaml and across packages.
+const (
+	ActionShowFirst        = "show_first"
+	ActionAddFromClipboard = "add_from_clipboard"
+	ActionSkip             = "skip"
+	ActionComplete         = "complete"
+	ActionManageQueue      = "manage_queue"
+)
+
 type HotkeyConfig struct {
 	Enabled bool   `yaml:"enabled" json:"enabled"`
 	Combo   string `yaml:"combo"   json:"combo"`
@@ -33,11 +42,11 @@ func defaultKeyConfig() KeyConfig {
 	return KeyConfig{
 		Version: 1,
 		Hotkeys: map[string]HotkeyConfig{
-			"show_first":         {Enabled: true, Combo: "ctrl+alt+q"},
-			"add_from_clipboard": {Enabled: true, Combo: "ctrl+alt+a"},
-			"skip":               {Enabled: true, Combo: "ctrl+alt+s"},
-			"complete":           {Enabled: true, Combo: "ctrl+alt+d"},
-			"manage_queue":       {Enabled: true, Combo: "ctrl+alt+m"},
+			ActionShowFirst:        {Enabled: true, Combo: "ctrl+alt+q"},
+			ActionAddFromClipboard: {Enabled: true, Combo: "ctrl+alt+a"},
+			ActionSkip:             {Enabled: true, Combo: "ctrl+alt+s"},
+			ActionComplete:         {Enabled: true, Combo: "ctrl+alt+d"},
+			ActionManageQueue:      {Enabled: true, Combo: "ctrl+alt+m"},
 		},
 	}
 }

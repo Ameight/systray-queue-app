@@ -477,11 +477,11 @@ var hotkeyMeta = []struct {
 	Key   string
 	Label string
 }{
-	{"show_first", "View current task"},
-	{"add_from_clipboard", "Add task (advanced)"},
-	{"skip", "Skip task"},
-	{"complete", "Complete task"},
-	{"manage_queue", "Manage queue"},
+	{hotkeys.ActionShowFirst, "View current task"},
+	{hotkeys.ActionAddFromClipboard, "Add task (advanced)"},
+	{hotkeys.ActionSkip, "Skip task"},
+	{hotkeys.ActionComplete, "Complete task"},
+	{hotkeys.ActionManageQueue, "Manage queue"},
 }
 
 func renderSettingsHTML(cfg hotkeys.KeyConfig) string {
