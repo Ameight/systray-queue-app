@@ -2,6 +2,7 @@ package hotkeys
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -70,7 +71,11 @@ func Save(dataDir string, cfg KeyConfig) error {
 	if err != nil {
 		return err
 	}
-	return util.AtomicWriteFile(path, out, 0644)
+	if err := util.AtomicWriteFile(path, out, 0644); err != nil {
+		return err
+	}
+	log.Printf("[hotkeys] saved config to %s", path)
+	return nil
 }
 
 // Validate checks that all enabled hotkey combos can be parsed.
@@ -138,6 +143,7 @@ func Register(cfg KeyConfig, actionFn map[string]func()) ([]Registered, error) {
 		if err := hk.Register(); err != nil {
 			return nil, fmt.Errorf("failed to register hotkey %s (%q): %w", action, hc.Combo, err)
 		}
+		log.Printf("[hotkeys] registered %s → %s", action, hc.Combo)
 
 		regs = append(regs, Registered{Action: action, HK: hk})
 
@@ -154,7 +160,11 @@ func Register(cfg KeyConfig, actionFn map[string]func()) ([]Registered, error) {
 // Unregister unregisters all registered hotkeys.
 func Unregister(regs []Registered) {
 	for _, r := range regs {
-		_ = r.HK.Unregister()
+		if err := r.HK.Unregister(); err != nil {
+			log.Printf("[hotkeys] unregister %s: %v", r.Action, err)
+		} else {
+			log.Printf("[hotkeys] unregistered %s", r.Action)
+		}
 	}
 }
 
