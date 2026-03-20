@@ -48,6 +48,10 @@ func NewTaskQueue(baseDir string) (*TaskQueue, error) {
 	return q, nil
 }
 
+func (q *TaskQueue) AttachmentsDir() string {
+	return q.attachmentsDir
+}
+
 func (q *TaskQueue) loadLocked() error {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -77,14 +81,14 @@ func (q *TaskQueue) saveLocked() error {
 	return atomicWriteFile(q.filePath, data, 0644)
 }
 
-func (q *TaskQueue) enqueue(t Task) error {
+func (q *TaskQueue) Enqueue(t Task) error {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.Tasks = append(q.Tasks, t)
 	return q.saveLocked()
 }
 
-func (q *TaskQueue) getAll() []Task {
+func (q *TaskQueue) GetAll() []Task {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
@@ -93,7 +97,7 @@ func (q *TaskQueue) getAll() []Task {
 	return res
 }
 
-func (q *TaskQueue) peek() (Task, bool) {
+func (q *TaskQueue) Peek() (Task, bool) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if len(q.Tasks) == 0 {
@@ -102,7 +106,7 @@ func (q *TaskQueue) peek() (Task, bool) {
 	return q.Tasks[0], true
 }
 
-func (q *TaskQueue) skip() error {
+func (q *TaskQueue) Skip() error {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if len(q.Tasks) <= 1 {
@@ -113,7 +117,7 @@ func (q *TaskQueue) skip() error {
 	return q.saveLocked()
 }
 
-func (q *TaskQueue) complete() (Task, error) {
+func (q *TaskQueue) Complete() (Task, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
@@ -128,15 +132,20 @@ func (q *TaskQueue) complete() (Task, error) {
 		return Task{}, err
 	}
 
-	// Удаляем вложение после успешного сохранения очереди
 	if task.AttachmentPath != "" && q.attachmentsDir != "" {
 		inside, err := isPathInsideDir(task.AttachmentPath, q.attachmentsDir)
 		if err == nil && inside {
-			_ = os.Remove(task.AttachmentPath) // мягко: не валим операцию, если файла уже нет
+			_ = os.Remove(task.AttachmentPath)
 		}
 	}
 
 	return task, nil
+}
+
+func (q *TaskQueue) ReorderByIndices(order []int) error {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.reorderByIndicesLocked(order)
 }
 
 func (q *TaskQueue) reorderByIndicesLocked(order []int) error {
@@ -163,12 +172,6 @@ func (q *TaskQueue) reorderByIndicesLocked(order []int) error {
 	return q.saveLocked()
 }
 
-func (q *TaskQueue) reorderByIndices(order []int) error {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	return q.reorderByIndicesLocked(order)
-}
-
 func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
 	dir := filepath.Dir(path)
 	base := filepath.Base(path)
@@ -179,7 +182,6 @@ func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
 	}
 	tmpName := tmp.Name()
 
-	// На всякий случай: если что-то пойдёт не так — уберём tmp
 	defer func() {
 		_ = tmp.Close()
 		_ = os.Remove(tmpName)
@@ -198,12 +200,10 @@ func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
 		return err
 	}
 
-	// Rename поверх целевого файла
 	if err := os.Rename(tmpName, path); err != nil {
 		return err
 	}
 
-	// Максимальная надёжность: sync директории (актуально на Unix)
 	if d, err := os.Open(dir); err == nil {
 		_ = d.Sync()
 		_ = d.Close()
@@ -226,9 +226,7 @@ func isPathInsideDir(filePath, dir string) (bool, error) {
 		return false, err
 	}
 
-	// rel не должен начинаться с ".." и не должен быть абсолютным
 	if rel == "." {
-		// файл = директория — нам не подходит
 		return false, nil
 	}
 	if strings.HasPrefix(rel, ".."+string(os.PathSeparator)) || rel == ".." || filepath.IsAbs(rel) {

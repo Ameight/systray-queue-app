@@ -7,9 +7,13 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Ameight/systray-queue-app/internal/queue"
-	"github.com/Ameight/systray-queue-app/internal/util"
 	"github.com/getlantern/systray"
+
+	"github.com/Ameight/systray-queue-app/internal/hotkeys"
+	"github.com/Ameight/systray-queue-app/internal/manage"
+	"github.com/Ameight/systray-queue-app/internal/queue"
+	"github.com/Ameight/systray-queue-app/internal/ui"
+	"github.com/Ameight/systray-queue-app/internal/util"
 )
 
 func Run() {
@@ -60,7 +64,6 @@ func onReady() {
 	}
 	updateTooltip()
 
-	// Hotkeys
 	cfg, cfgPath, err := hotkeys.LoadOrCreate(dataDir)
 	if err != nil {
 		ui.Error("Hotkeys", err.Error())
@@ -90,7 +93,11 @@ func onReady() {
 				if !ok {
 					continue
 				}
-				t := queue.Task{ID: fmt.Sprintf("%d", timeNowNano()), Text: text, CreatedAt: timeNow()}
+				t := queue.Task{
+					ID:        fmt.Sprintf("%d", timeNowNano()),
+					Text:      text,
+					CreatedAt: timeNow(),
+				}
 				if err := q.Enqueue(t); err != nil {
 					ui.Error("Add task", err.Error())
 				}
@@ -119,7 +126,6 @@ func onExit() {
 	hotkeys.Unregister(hkRegs)
 }
 
-// tiny wrappers to avoid sprinkling time package everywhere
 func timeNow() time.Time { return time.Now() }
 func timeNowNano() int64 { return time.Now().UnixNano() }
 

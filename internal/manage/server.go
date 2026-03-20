@@ -7,6 +7,7 @@ import (
 	"mime/multipart"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	"github.com/Ameight/systray-queue-app/internal/queue"
+	"github.com/Ameight/systray-queue-app/internal/ui"
 	"github.com/Ameight/systray-queue-app/internal/util"
 )
 
@@ -53,6 +55,7 @@ func (s *Server) start() (string, error) {
 	mux.HandleFunc("/add_submit", s.handleAddSubmit)
 	mux.HandleFunc("/view", s.handleView)
 	mux.HandleFunc("/action", s.handleAction)
+	mux.HandleFunc("/attachment", s.handleAttachment)
 
 	srv := &http.Server{
 		Handler:           mux,
@@ -151,7 +154,6 @@ func (s *Server) handleAddSubmit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// redirect to view
 	http.Redirect(w, r, "/view", http.StatusSeeOther)
 }
 
@@ -168,7 +170,6 @@ func (s *Server) saveUploadedAttachment(file multipart.File, hdr *multipart.File
 		return "", queue.AttachmentNone, fmt.Errorf("unsupported attachment type: %s", ext)
 	}
 
-	// store under attachments with unique name
 	fn := fmt.Sprintf("%d%s", time.Now().UnixNano(), ext)
 	path := filepath.Join(s.q.AttachmentsDir(), fn)
 	out, err := os.Create(path)
@@ -196,11 +197,33 @@ func (s *Server) handleView(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	frag, err := ui.RenderTaskHTML(t)
+	// For image/audio attachments uploaded via the browser, serve via /attachment endpoint.
+	taskText := t.Text
+	if t.AttachmentType == queue.AttachmentImage && t.AttachmentPath != "" {
+		name := filepath.Base(t.AttachmentPath)
+		imgURL := "/attachment?name=" + url.QueryEscape(name)
+		taskText += "\n\n![attachment](" + imgURL + ")\n"
+	}
+
+	frag, err := ui.RenderTaskHTML(queue.Task{
+		ID:             t.ID,
+		Text:           taskText,
+		CreatedAt:      t.CreatedAt,
+		AttachmentPath: t.AttachmentPath,
+		AttachmentType: t.AttachmentType,
+	})
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+
+	// For audio, override the file:// URL with a server-relative one.
+	if t.AttachmentType == queue.AttachmentAudio && t.AttachmentPath != "" {
+		name := filepath.Base(t.AttachmentPath)
+		audioTag := fmt.Sprintf(`<audio controls src="/attachment?name=%s"></audio>`, url.QueryEscape(name))
+		frag += "\n" + audioTag
+	}
+
 	body := fmt.Sprintf(`<h1>Current task</h1>
 <div class="row">
   <button onclick="doAction('done')">Done</button>
@@ -253,18 +276,37 @@ func (s *Server) handleAction(w http.ResponseWriter, r *http.Request) {
 	io.WriteString(w, `{"ok":true}`)
 }
 
+// handleAttachment serves files from the attachments directory.
+func (s *Server) handleAttachment(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	name := r.URL.Query().Get("name")
+	if name == "" || strings.Contains(name, "/") || strings.Contains(name, "\\") || strings.Contains(name, "..") {
+		http.Error(w, "invalid name", http.StatusBadRequest)
+		return
+	}
+	path := filepath.Join(s.q.AttachmentsDir(), name)
+	inside, err := util.IsPathInsideDir(path, s.q.AttachmentsDir())
+	if err != nil || !inside {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	http.ServeFile(w, r, path)
+}
+
 func renderAddHTML() string {
 	return `<h1>Add task</h1>
 <form action="/add_submit" method="post" enctype="multipart/form-data">
   <div class="row"><button type="submit">Save</button><button type="button" onclick="location.href='/view'">Cancel</button></div>
-  <div class="muted">Markdown supported. You can attach an image or audio file.</div>
+  <p class="muted">Markdown supported. You can attach an image or audio file.</p>
   <p><textarea name="text" placeholder="Write task in Markdown..."></textarea></p>
-  <p><input type="file" name="attachment" /></p>
+  <p><label>Attachment: <input type="file" name="attachment" accept="image/*,audio/*" /></label></p>
 </form>`
 }
 
 func renderManageHTML(tasks []queue.Task) string {
-	// reuse DnD UI similar to previous version + links
 	esc := func(s string) string {
 		replacer := strings.NewReplacer(
 			"&", "&amp;",
