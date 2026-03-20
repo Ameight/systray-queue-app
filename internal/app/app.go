@@ -65,8 +65,30 @@ func onReady() {
 	}
 	updateTooltip()
 
+	quickAdd := func() {
+		text, ok, err := ui.QuickAddText()
+		if err != nil {
+			ui.Error("Add task", err.Error())
+			return
+		}
+		if !ok {
+			return
+		}
+		t := queue.Task{
+			ID:        fmt.Sprintf("%d", timeNowNano()),
+			Text:      text,
+			CreatedAt: timeNow(),
+		}
+		if err := q.Enqueue(t); err != nil {
+			ui.Error("Add task", err.Error())
+			return
+		}
+		updateTooltip()
+	}
+
 	actions := map[string]func(){
 		hotkeys.ActionShowFirst:        func() { _ = openURL("/view") },
+		hotkeys.ActionAddQuick:         quickAdd,
 		hotkeys.ActionManageQueue:      func() { _ = openURL("/") },
 		hotkeys.ActionAddFromClipboard: func() { _ = openURL("/add") },
 		hotkeys.ActionSkip:             func() { _ = q.Skip(); updateTooltip() },
@@ -82,6 +104,7 @@ func onReady() {
 	}
 	hotkeyMenuItems := []menuItem{
 		{mView, "Open current task in browser", hotkeys.ActionShowFirst},
+		{mAddQuick, "Quick add", hotkeys.ActionAddQuick},
 		{mAddAdvanced, "Open advanced editor in browser", hotkeys.ActionAddFromClipboard},
 		{mSkip, "Move current task to the end", hotkeys.ActionSkip},
 		{mDone, "Complete current task", hotkeys.ActionComplete},
@@ -128,23 +151,7 @@ func onReady() {
 		for {
 			select {
 			case <-mAddQuick.ClickedCh:
-				text, ok, err := ui.QuickAddText()
-				if err != nil {
-					ui.Error("Add task", err.Error())
-					continue
-				}
-				if !ok {
-					continue
-				}
-				t := queue.Task{
-					ID:        fmt.Sprintf("%d", timeNowNano()),
-					Text:      text,
-					CreatedAt: timeNow(),
-				}
-				if err := q.Enqueue(t); err != nil {
-					ui.Error("Add task", err.Error())
-				}
-				updateTooltip()
+				quickAdd()
 			case <-mAddAdvanced.ClickedCh:
 				_ = openURL("/add")
 			case <-mView.ClickedCh:

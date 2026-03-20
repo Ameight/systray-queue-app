@@ -17,6 +17,7 @@ import (
 // Action keys — used as identifiers in key-config.yaml and across packages.
 const (
 	ActionShowFirst        = "show_first"
+	ActionAddQuick         = "add_quick"
 	ActionAddFromClipboard = "add_from_clipboard"
 	ActionSkip             = "skip"
 	ActionComplete         = "complete"
@@ -43,6 +44,7 @@ func defaultKeyConfig() KeyConfig {
 		Version: 1,
 		Hotkeys: map[string]HotkeyConfig{
 			ActionShowFirst:        {Enabled: true, Combo: "ctrl+alt+q"},
+			ActionAddQuick:         {Enabled: true, Combo: "ctrl+alt+n"},
 			ActionAddFromClipboard: {Enabled: true, Combo: "ctrl+alt+a"},
 			ActionSkip:             {Enabled: true, Combo: "ctrl+alt+s"},
 			ActionComplete:         {Enabled: true, Combo: "ctrl+alt+d"},

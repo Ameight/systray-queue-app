@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -67,6 +68,7 @@ func (s *Server) start() (string, error) {
 	mux.HandleFunc("/attachment", s.handleAttachment)
 	mux.HandleFunc("/settings", s.handleSettings)
 	mux.HandleFunc("/settings/save", s.handleSettingsSave)
+	mux.HandleFunc("/transcribe", s.handleTranscribe)
 
 	srv := &http.Server{
 		Handler:           mux,
@@ -150,6 +152,21 @@ func (s *Server) handleAddSubmit(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
+		}
+	}
+
+	// If no manual attachment but a voice recording was transcribed, use it.
+	if attachmentPath == "" {
+		voiceFn := strings.TrimSpace(r.FormValue("voice_attachment"))
+		if voiceFn != "" && !strings.Contains(voiceFn, "/") && !strings.Contains(voiceFn, "\\") && !strings.Contains(voiceFn, "..") {
+			candidate := filepath.Join(s.q.AttachmentsDir(), voiceFn)
+			inside, err := util.IsPathInsideDir(candidate, s.q.AttachmentsDir())
+			if err == nil && inside {
+				if _, err := os.Stat(candidate); err == nil {
+					attachmentPath = candidate
+					attachmentType = queue.AttachmentAudio
+				}
+			}
 		}
 	}
 
@@ -309,12 +326,103 @@ func (s *Server) handleAttachment(w http.ResponseWriter, r *http.Request) {
 
 func renderAddHTML() string {
 	return `<h1>Add task</h1>
-<form action="/add_submit" method="post" enctype="multipart/form-data">
-  <div class="row"><button type="submit">Save</button><button type="button" onclick="location.href='/view'">Cancel</button></div>
-  <p class="muted">Markdown supported. You can attach an image or audio file.</p>
-  <p><textarea name="text" placeholder="Write task in Markdown..."></textarea></p>
+<form id="task-form" action="/add_submit" method="post" enctype="multipart/form-data">
+  <div class="row">
+    <button type="submit">Save</button>
+    <button type="button" onclick="location.href='/view'">Cancel</button>
+  </div>
+  <p class="muted">Markdown supported. You can attach an image or record a voice note (requires <a href="https://github.com/openai/whisper" target="_blank">whisper</a>).</p>
+  <p><textarea name="text" id="task-text" placeholder="Write task in Markdown..."></textarea></p>
   <p><label>Attachment: <input type="file" name="attachment" accept="image/*,audio/*" /></label></p>
-</form>`
+
+  <div style="margin-top:12px">
+    <div class="row">
+      <button type="button" id="rec-btn">Record voice note</button>
+      <span id="rec-status" class="muted"></span>
+    </div>
+    <div id="rec-player" style="display:none;margin-top:8px"></div>
+  </div>
+
+  <input type="hidden" name="voice_attachment" id="voice-attachment-name" value="">
+</form>
+
+<script>
+(function(){
+  const btn = document.getElementById('rec-btn');
+  const status = document.getElementById('rec-status');
+  const player = document.getElementById('rec-player');
+  const voiceField = document.getElementById('voice-attachment-name');
+  const textarea = document.getElementById('task-text');
+
+  let mediaRecorder = null;
+  let chunks = [];
+
+  btn.addEventListener('click', async () => {
+    if (mediaRecorder && mediaRecorder.state === 'recording') {
+      mediaRecorder.stop();
+      return;
+    }
+
+    let stream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch (e) {
+      status.textContent = 'Microphone access denied: ' + e.message;
+      return;
+    }
+
+    const mimeType = ['audio/webm', 'audio/ogg', 'audio/mp4'].find(m => MediaRecorder.isTypeSupported(m)) || '';
+    mediaRecorder = new MediaRecorder(stream, mimeType ? { mimeType } : {});
+    chunks = [];
+
+    mediaRecorder.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data); };
+
+    mediaRecorder.onstop = async () => {
+      stream.getTracks().forEach(t => t.stop());
+      btn.textContent = 'Record voice note';
+      status.textContent = 'Transcribing…';
+
+      const blob = new Blob(chunks, { type: mediaRecorder.mimeType || 'audio/webm' });
+
+      // Show local preview while waiting for transcription.
+      const url = URL.createObjectURL(blob);
+      player.innerHTML = '<audio controls src="' + url + '"></audio>';
+      player.style.display = '';
+
+      try {
+        const res = await fetch('/transcribe', {
+          method: 'POST',
+          headers: { 'Content-Type': blob.type || 'audio/webm' },
+          body: blob,
+        });
+        const data = await res.json();
+
+        if (data.filename) {
+          voiceField.value = data.filename;
+          // Replace local blob URL with server URL for the saved file.
+          player.innerHTML = '<audio controls src="/attachment?name=' + encodeURIComponent(data.filename) + '"></audio>';
+        }
+
+        if (data.error) {
+          status.textContent = 'Transcription error: ' + data.error;
+        } else if (data.text) {
+          const prefix = '\n\n---\n\u{1F3A4} **Голосовая заметка:**\n';
+          textarea.value += prefix + data.text;
+          status.textContent = 'Transcribed.';
+        } else {
+          status.textContent = 'Recording saved (no transcription).';
+        }
+      } catch (e) {
+        status.textContent = 'Upload error: ' + e.message;
+      }
+    };
+
+    mediaRecorder.start();
+    btn.textContent = 'Stop recording';
+    status.textContent = 'Recording…';
+  });
+})();
+</script>`
 }
 
 func renderManageHTML(tasks []queue.Task) string {
@@ -426,6 +534,82 @@ func renderManageHTML(tasks []queue.Task) string {
 	return b.String()
 }
 
+// handleTranscribe receives a raw audio blob, saves it, transcribes with whisper,
+// and returns {"text":"...","filename":"..."}.
+func (s *Server) handleTranscribe(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	// Limit upload to 100 MB.
+	r.Body = http.MaxBytesReader(w, r.Body, 100<<20)
+
+	// Detect extension from Content-Type.
+	ct := r.Header.Get("Content-Type")
+	ext := ".webm"
+	switch {
+	case strings.Contains(ct, "ogg"):
+		ext = ".ogg"
+	case strings.Contains(ct, "mp4"):
+		ext = ".mp4"
+	case strings.Contains(ct, "wav"):
+		ext = ".wav"
+	}
+
+	fn := fmt.Sprintf("%d%s", time.Now().UnixNano(), ext)
+	audioPath := filepath.Join(s.q.AttachmentsDir(), fn)
+	out, err := os.Create(audioPath)
+	if err != nil {
+		http.Error(w, "cannot create file: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if _, err := io.Copy(out, r.Body); err != nil {
+		out.Close()
+		os.Remove(audioPath)
+		http.Error(w, "write error: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	out.Close()
+
+	text, err := transcribeAudio(audioPath)
+	if err != nil {
+		// Return the audio filename even if transcription failed, so the
+		// user can still keep the recording.
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		errMsg := strings.ReplaceAll(err.Error(), `"`, `\"`)
+		fmt.Fprintf(w, `{"text":"","filename":%q,"error":%q}`, fn, errMsg)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	data, _ := json.Marshal(map[string]string{"text": text, "filename": fn})
+	w.Write(data)
+}
+
+// transcribeAudio runs the whisper CLI on audioPath and returns the transcribed text.
+func transcribeAudio(audioPath string) (string, error) {
+	whisperBin, err := exec.LookPath("whisper")
+	if err != nil {
+		return "", fmt.Errorf("whisper not found in PATH (install with: pip install openai-whisper)")
+	}
+	outDir := filepath.Dir(audioPath)
+	// whisper <file> --output_format txt --output_dir <dir>
+	cmd := exec.Command(whisperBin, audioPath, "--output_format", "txt", "--output_dir", outDir)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return "", fmt.Errorf("whisper error: %w\n%s", err, string(out))
+	}
+	// Whisper writes <basename>.txt next to the audio file.
+	base := strings.TrimSuffix(filepath.Base(audioPath), filepath.Ext(audioPath))
+	txtPath := filepath.Join(outDir, base+".txt")
+	txtBytes, err := os.ReadFile(txtPath)
+	if err != nil {
+		return "", fmt.Errorf("cannot read whisper output: %w", err)
+	}
+	_ = os.Remove(txtPath) // clean up the .txt file; we only need the text
+	return strings.TrimSpace(string(txtBytes)), nil
+}
+
 func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -478,7 +662,8 @@ var hotkeyMeta = []struct {
 	Label string
 }{
 	{hotkeys.ActionShowFirst, "View current task"},
-	{hotkeys.ActionAddFromClipboard, "Add task (advanced)"},
+	{hotkeys.ActionAddQuick, "Add task (quick dialog)"},
+	{hotkeys.ActionAddFromClipboard, "Add task (advanced editor)"},
 	{hotkeys.ActionSkip, "Skip task"},
 	{hotkeys.ActionComplete, "Complete task"},
 	{hotkeys.ActionManageQueue, "Manage queue"},
