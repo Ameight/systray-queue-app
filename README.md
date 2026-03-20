@@ -103,7 +103,15 @@ hotkeys:
     combo: "ctrl+alt+m"
 ```
 
-Поддерживаемые модификаторы: `ctrl`, `alt`/`option`, `shift`, `cmd`.
+Поддерживаемые модификаторы:
+
+| Имя в конфиге | Клавиша macOS |
+|---|---|
+| `ctrl` | ⌃ Control |
+| `alt` или `option` | ⌥ Option |
+| `shift` | ⇧ Shift |
+| `cmd` | ⌘ Command |
+
 Поддерживаемые клавиши: `a`–`z`, `0`–`9`, `f1`–`f12`, `space`, `enter`, `tab`, `esc`.
 
 Чтобы отключить отдельный хоткей: `enabled: false`.

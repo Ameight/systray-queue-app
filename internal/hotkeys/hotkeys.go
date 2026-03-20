@@ -14,13 +14,13 @@ import (
 )
 
 type HotkeyConfig struct {
-	Enabled bool   `yaml:"enabled"`
-	Combo   string `yaml:"combo"`
+	Enabled bool   `yaml:"enabled" json:"enabled"`
+	Combo   string `yaml:"combo"   json:"combo"`
 }
 
 type KeyConfig struct {
-	Version int                     `yaml:"version"`
-	Hotkeys map[string]HotkeyConfig `yaml:"hotkeys"`
+	Version int                     `yaml:"version" json:"version"`
+	Hotkeys map[string]HotkeyConfig `yaml:"hotkeys" json:"hotkeys"`
 }
 
 type Registered struct {
@@ -39,6 +39,28 @@ func defaultKeyConfig() KeyConfig {
 			"manage_queue":       {Enabled: true, Combo: "ctrl+alt+m"},
 		},
 	}
+}
+
+// FormatCombo converts a combo string like "ctrl+alt+q" to macOS symbols "⌃⌥Q".
+// Unknown tokens are left as-is.
+func FormatCombo(combo string) string {
+	parts := strings.Split(strings.ToLower(strings.TrimSpace(combo)), "+")
+	var b strings.Builder
+	for _, p := range parts {
+		switch strings.TrimSpace(p) {
+		case "ctrl", "control":
+			b.WriteString("⌃")
+		case "alt", "option":
+			b.WriteString("⌥")
+		case "shift":
+			b.WriteString("⇧")
+		case "cmd", "command", "meta", "super", "win":
+			b.WriteString("⌘")
+		default:
+			b.WriteString(strings.ToUpper(p))
+		}
+	}
+	return b.String()
 }
 
 // Save writes cfg to key-config.yaml inside dataDir.

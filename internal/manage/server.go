@@ -30,7 +30,7 @@ type Server struct {
 	url  string
 	err  error
 
-	reloadHotkeys func()
+	reloadHotkeys func() error
 }
 
 func New(q *queue.TaskQueue, baseDir string) *Server {
@@ -38,7 +38,8 @@ func New(q *queue.TaskQueue, baseDir string) *Server {
 }
 
 // SetReloadFn sets a callback that is invoked after hotkey config is saved.
-func (s *Server) SetReloadFn(fn func()) {
+// The function should return an error if re-registration fails.
+func (s *Server) SetReloadFn(fn func() error) {
 	s.reloadHotkeys = fn
 }
 
@@ -458,11 +459,14 @@ func (s *Server) handleSettingsSave(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := hotkeys.Save(s.baseDir, cfg); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Error(w, "save failed: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 	if s.reloadHotkeys != nil {
-		go s.reloadHotkeys()
+		if err := s.reloadHotkeys(); err != nil {
+			http.Error(w, "reload failed: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	io.WriteString(w, `{"ok":true}`)
@@ -488,7 +492,15 @@ func renderSettingsHTML(cfg hotkeys.KeyConfig) string {
 	var b strings.Builder
 	b.WriteString(`<h1>Settings</h1>`)
 	b.WriteString(`<h2 style="font-size:16px;margin:20px 0 10px">Hotkeys</h2>`)
-	b.WriteString(`<p class="muted">Modifiers: <code>ctrl</code>, <code>alt</code>, <code>shift</code>, <code>cmd</code> &nbsp;·&nbsp; Keys: <code>a</code>–<code>z</code>, <code>0</code>–<code>9</code>, <code>f1</code>–<code>f12</code></p>`)
+	b.WriteString(`<p class="muted">
+  Modifiers:
+  <code>ctrl</code> ⌃ &nbsp;·&nbsp;
+  <code>alt</code> / <code>option</code> ⌥ &nbsp;·&nbsp;
+  <code>shift</code> ⇧ &nbsp;·&nbsp;
+  <code>cmd</code> ⌘
+  &nbsp;&nbsp;|&nbsp;&nbsp;
+  Keys: <code>a</code>–<code>z</code>, <code>0</code>–<code>9</code>, <code>f1</code>–<code>f12</code>
+</p>`)
 
 	b.WriteString(`<table style="border-collapse:collapse;width:100%;max-width:560px">`)
 	b.WriteString(`<thead><tr>`)

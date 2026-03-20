@@ -73,29 +73,55 @@ func onReady() {
 		"complete":           func() { _, _ = q.Complete(); updateTooltip() },
 	}
 
+	// menuHotkeys maps hotkey action → menu item tooltip base text.
+	// Used to show the hotkey combo in the tray menu on hover.
+	type menuItem struct {
+		item    *systray.MenuItem
+		base    string
+		action  string
+	}
+	hotkeyMenuItems := []menuItem{
+		{mView, "Open current task in browser", "show_first"},
+		{mAddAdvanced, "Open advanced editor in browser", "add_from_clipboard"},
+		{mSkip, "Move current task to the end", "skip"},
+		{mDone, "Complete current task", "complete"},
+		{mManage, "Reorder tasks", "manage_queue"},
+	}
+
+	applyTooltips := func(cfg hotkeys.KeyConfig) {
+		for _, m := range hotkeyMenuItems {
+			tooltip := m.base
+			if hc, ok := cfg.Hotkeys[m.action]; ok && hc.Enabled && hc.Combo != "" {
+				tooltip += "  " + hotkeys.FormatCombo(hc.Combo)
+			}
+			m.item.SetTooltip(tooltip)
+		}
+	}
+
 	cfg, cfgPath, err := hotkeys.LoadOrCreate(dataDir)
 	if err != nil {
 		ui.Error("Hotkeys", err.Error())
 	} else {
+		applyTooltips(cfg)
 		hkRegs, err = hotkeys.Register(cfg, actions)
 		if err != nil {
 			ui.Error("Hotkeys", err.Error()+"\nConfig: "+cfgPath)
 		}
 	}
 
-	mgr.SetReloadFn(func() {
+	mgr.SetReloadFn(func() error {
 		hotkeys.Unregister(hkRegs)
 		newCfg, _, err := hotkeys.LoadOrCreate(dataDir)
 		if err != nil {
-			ui.Error("Hotkeys", "Reload failed: "+err.Error())
-			return
+			return err
 		}
 		newRegs, err := hotkeys.Register(newCfg, actions)
 		if err != nil {
-			ui.Error("Hotkeys", "Reload failed: "+err.Error())
-			return
+			return err
 		}
 		hkRegs = newRegs
+		applyTooltips(newCfg)
+		return nil
 	})
 
 	go func() {
