@@ -211,7 +211,7 @@ func parseHotkeyCombo(combo string) ([]hotkey.Modifier, hotkey.Key, error) {
 
 func parseKeyToken(t string) (hotkey.Key, bool) {
 	if len(t) == 1 && t[0] >= 'a' && t[0] <= 'z' {
-		return hotkey.Key(t[0] - 'a' + byte(hotkey.KeyA)), true
+		return letterKey(t[0])
 	}
 	if len(t) == 1 && t[0] >= '0' && t[0] <= '9' {
 		switch t[0] {
