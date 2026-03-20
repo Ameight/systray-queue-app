@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"mime/multipart"
 	"net"
 	"net/http"
@@ -574,12 +575,18 @@ func (s *Server) handleTranscribe(w http.ResponseWriter, r *http.Request) {
 
 	text, err := transcribeAudio(audioPath)
 	if err != nil {
-		// Return the audio filename even if transcription failed, so the
-		// user can still keep the recording.
+		// Log full details, show user a short message.
+		userMsg := err.Error()
+		if te, ok := err.(*transcribeError); ok {
+			log.Printf("[whisper] transcription failed: %s", te.Detail)
+			userMsg = te.UserMsg
+		} else {
+			log.Printf("[whisper] transcription failed: %v", err)
+		}
+		// Return the audio filename so the recording is still kept.
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		w.WriteHeader(http.StatusOK)
-		errMsg := strings.ReplaceAll(err.Error(), `"`, `\"`)
-		fmt.Fprintf(w, `{"text":"","filename":%q,"error":%q}`, fn, errMsg)
+		data, _ := json.Marshal(map[string]string{"text": "", "filename": fn, "error": userMsg})
+		w.Write(data)
 		return
 	}
 
@@ -588,40 +595,83 @@ func (s *Server) handleTranscribe(w http.ResponseWriter, r *http.Request) {
 	w.Write(data)
 }
 
-// preloadWhisperModel downloads the whisper model in the background at startup
-// so the first transcription does not stall waiting for a download.
-func preloadWhisperModel() {
-	whisperBin, err := exec.LookPath("whisper")
+// whisper tiny model: URL and expected local filename inside the cache dir.
+const (
+	whisperTinyURL      = "https://openaipublic.azureedge.net/main/whisper/models/65147644a518d12f04e32d6f3b26facc3f8dd46e5390956a9424a650c0ce22b9/tiny.pt"
+	whisperTinyFilename = "tiny.pt"
+)
+
+// whisperCacheDir returns ~/.cache/whisper (the default download_root used by the whisper Python library).
+func whisperCacheDir() string {
+	home, err := os.UserHomeDir()
 	if err != nil {
-		return // whisper not installed — nothing to preload
+		return ""
+	}
+	return filepath.Join(home, ".cache", "whisper")
+}
+
+// preloadWhisperModel downloads the whisper model via Go's HTTP client in the
+// background at startup, so the first transcription does not stall waiting for
+// a download. Go's http.Client bypasses system proxy settings that can interfere
+// with Python's urllib.
+func preloadWhisperModel() {
+	if _, err := exec.LookPath("whisper"); err != nil {
+		return // whisper not installed
 	}
 
-	// Feed whisper a minimal valid WAV (44-byte header, 0 audio samples).
-	// Whisper will load (and cache) the model, then fail on the empty audio — that's fine.
-	tmp, err := os.CreateTemp("", "whisper-preload-*.wav")
+	cacheDir := whisperCacheDir()
+	if cacheDir == "" {
+		return
+	}
+	modelPath := filepath.Join(cacheDir, whisperTinyFilename)
+
+	// Already cached — nothing to do.
+	if _, err := os.Stat(modelPath); err == nil {
+		return
+	}
+
+	if err := os.MkdirAll(cacheDir, 0755); err != nil {
+		return
+	}
+
+	log.Printf("[whisper] downloading tiny model to %s …", modelPath)
+	resp, err := http.Get(whisperTinyURL) //nolint:noctx
+	if err != nil {
+		log.Printf("[whisper] model download failed: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	tmp, err := os.CreateTemp(cacheDir, "tiny-*.pt.tmp")
 	if err != nil {
 		return
 	}
-	defer os.Remove(tmp.Name())
+	tmpName := tmp.Name()
+	defer func() { _ = os.Remove(tmpName) }()
 
-	// Minimal RIFF/WAV header: PCM, 1 ch, 16 kHz, 16-bit, 0 samples.
-	wav := []byte{
-		'R', 'I', 'F', 'F', 36, 0, 0, 0, // RIFF chunk size = 36
-		'W', 'A', 'V', 'E',
-		'f', 'm', 't', ' ', 16, 0, 0, 0, // fmt chunk, 16 bytes
-		1, 0, // PCM
-		1, 0, // mono
-		0x80, 0x3E, 0, 0, // 16000 Hz
-		0, 0x7D, 0, 0, // byte rate = 32000
-		2, 0, // block align
-		16, 0, // bits per sample
-		'd', 'a', 't', 'a', 0, 0, 0, 0, // data chunk, 0 bytes
+	if _, err := io.Copy(tmp, resp.Body); err != nil {
+		tmp.Close()
+		return
 	}
-	tmp.Write(wav)
 	tmp.Close()
 
-	cmd := exec.Command(whisperBin, tmp.Name(), "--model", whisperModel, "--output_format", "txt", "--output_dir", os.TempDir())
-	_ = cmd.Run() // errors expected (empty audio); model is cached after this
+	if err := os.Rename(tmpName, modelPath); err != nil {
+		return
+	}
+	log.Printf("[whisper] tiny model ready")
+}
+
+// clearProxyEnv returns env with HTTP(S)_PROXY variables removed.
+func clearProxyEnv(env []string) []string {
+	out := env[:0:len(env)]
+	for _, e := range env {
+		key := strings.ToUpper(strings.SplitN(e, "=", 2)[0])
+		if key == "HTTP_PROXY" || key == "HTTPS_PROXY" || key == "ALL_PROXY" {
+			continue
+		}
+		out = append(out, e)
+	}
+	return out
 }
 
 // whisperModel is the default model used for transcription.
@@ -629,25 +679,52 @@ func preloadWhisperModel() {
 const whisperModel = "tiny"
 
 // transcribeAudio runs the whisper CLI on audioPath and returns the transcribed text.
+// transcribeError carries a short user-facing message and a detailed cause for logging.
+type transcribeError struct {
+	UserMsg string
+	Detail  string
+}
+
+func (e *transcribeError) Error() string { return e.UserMsg + ": " + e.Detail }
+
 func transcribeAudio(audioPath string) (string, error) {
 	whisperBin, err := exec.LookPath("whisper")
 	if err != nil {
-		return "", fmt.Errorf("whisper not found in PATH (install with: pip install openai-whisper)")
+		return "", &transcribeError{
+			UserMsg: "Whisper не установлен",
+			Detail:  "binary not found in PATH; install with: pip install openai-whisper",
+		}
 	}
 	outDir := filepath.Dir(audioPath)
-	// whisper <file> --model tiny --output_format txt --output_dir <dir>
 	cmd := exec.Command(whisperBin, audioPath, "--model", whisperModel, "--output_format", "txt", "--output_dir", outDir)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return "", fmt.Errorf("whisper error: %w\n%s\n\nTip: run 'whisper --model %s /dev/null' once to pre-download the model", err, string(out), whisperModel)
+	// Clear proxy env vars so Python's urllib does not try to tunnel through a
+	// system proxy (which can interfere with loading the already-cached model).
+	cmd.Env = clearProxyEnv(os.Environ())
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		userMsg := "Ошибка транскрипции"
+		outStr := string(out)
+		switch {
+		case strings.Contains(outStr, "URLError") || strings.Contains(outStr, "urlopen") || strings.Contains(outStr, "RemoteDisconnected"):
+			userMsg = "Не удалось загрузить модель Whisper — нет доступа к сети"
+		case strings.Contains(outStr, "load_model") || strings.Contains(outStr, "download"):
+			userMsg = "Ошибка загрузки модели Whisper"
+		case strings.Contains(outStr, "No such file"):
+			userMsg = "Аудиофайл не найден"
+		}
+		return "", &transcribeError{UserMsg: userMsg, Detail: fmt.Sprintf("exit: %v\n%s", err, outStr)}
 	}
 	// Whisper writes <basename>.txt next to the audio file.
 	base := strings.TrimSuffix(filepath.Base(audioPath), filepath.Ext(audioPath))
 	txtPath := filepath.Join(outDir, base+".txt")
 	txtBytes, err := os.ReadFile(txtPath)
 	if err != nil {
-		return "", fmt.Errorf("cannot read whisper output: %w", err)
+		return "", &transcribeError{
+			UserMsg: "Не удалось прочитать результат транскрипции",
+			Detail:  err.Error(),
+		}
 	}
-	_ = os.Remove(txtPath) // clean up the .txt file; we only need the text
+	_ = os.Remove(txtPath)
 	return strings.TrimSpace(string(txtBytes)), nil
 }
 
