@@ -1,6 +1,15 @@
 export GOPROXY=https://proxy.golang.org
 
-.PHONY: build-win
-build-win:
-	go build -ldflags="-H=windowsgui" -o systray-queue-app.exe
+APP = systray-queue-app
 
+.PHONY: build run clean
+
+build:
+	CGO_ENABLED=1 GOOS=darwin GOARCH=arm64 \
+	go build -o $(APP) .
+
+run:
+	go run .
+
+clean:
+	rm -f $(APP)

@@ -129,7 +129,7 @@ func parseHotkeyCombo(combo string) ([]hotkey.Modifier, hotkey.Key, error) {
 		case "ctrl", "control":
 			mods = append(mods, hotkey.ModCtrl)
 		case "alt", "option":
-			mods = append(mods, hotkey.ModAlt)
+			mods = append(mods, modAlt)
 		case "shift":
 			mods = append(mods, hotkey.ModShift)
 		case "cmd", "command", "meta", "super", "win":
