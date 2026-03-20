@@ -56,6 +56,7 @@ func onReady() {
 	mSkip := systray.AddMenuItem("Skip", "Move current task to the end")
 	mDone := systray.AddMenuItem("Done", "Complete current task")
 	systray.AddSeparator()
+	mSettings := systray.AddMenuItem("Settings…", "Configure hotkeys")
 	mQuit := systray.AddMenuItem("Quit", "Quit")
 
 	updateTooltip := func() {
@@ -64,22 +65,38 @@ func onReady() {
 	}
 	updateTooltip()
 
+	actions := map[string]func(){
+		"show_first":         func() { _ = openURL("/view") },
+		"manage_queue":       func() { _ = openURL("/") },
+		"add_from_clipboard": func() { _ = openURL("/add") },
+		"skip":               func() { _ = q.Skip(); updateTooltip() },
+		"complete":           func() { _, _ = q.Complete(); updateTooltip() },
+	}
+
 	cfg, cfgPath, err := hotkeys.LoadOrCreate(dataDir)
 	if err != nil {
 		ui.Error("Hotkeys", err.Error())
 	} else {
-		actions := map[string]func(){
-			"show_first":         func() { _ = openURL("/view") },
-			"manage_queue":       func() { _ = openURL("/") },
-			"add_from_clipboard": func() { _ = openURL("/add") },
-			"skip":               func() { _ = q.Skip(); updateTooltip() },
-			"complete":           func() { _, _ = q.Complete(); updateTooltip() },
-		}
 		hkRegs, err = hotkeys.Register(cfg, actions)
 		if err != nil {
 			ui.Error("Hotkeys", err.Error()+"\nConfig: "+cfgPath)
 		}
 	}
+
+	mgr.SetReloadFn(func() {
+		hotkeys.Unregister(hkRegs)
+		newCfg, _, err := hotkeys.LoadOrCreate(dataDir)
+		if err != nil {
+			ui.Error("Hotkeys", "Reload failed: "+err.Error())
+			return
+		}
+		newRegs, err := hotkeys.Register(newCfg, actions)
+		if err != nil {
+			ui.Error("Hotkeys", "Reload failed: "+err.Error())
+			return
+		}
+		hkRegs = newRegs
+	})
 
 	go func() {
 		for {
@@ -114,6 +131,8 @@ func onReady() {
 			case <-mDone.ClickedCh:
 				_, _ = q.Complete()
 				updateTooltip()
+			case <-mSettings.ClickedCh:
+				_ = openURL("/settings")
 			case <-mQuit.ClickedCh:
 				systray.Quit()
 				return

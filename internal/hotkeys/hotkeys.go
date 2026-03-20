@@ -41,6 +41,29 @@ func defaultKeyConfig() KeyConfig {
 	}
 }
 
+// Save writes cfg to key-config.yaml inside dataDir.
+func Save(dataDir string, cfg KeyConfig) error {
+	path := filepath.Join(dataDir, "key-config.yaml")
+	out, err := yaml.Marshal(cfg)
+	if err != nil {
+		return err
+	}
+	return util.AtomicWriteFile(path, out, 0644)
+}
+
+// Validate checks that all enabled hotkey combos can be parsed.
+func Validate(cfg KeyConfig) error {
+	for action, hc := range cfg.Hotkeys {
+		if !hc.Enabled {
+			continue
+		}
+		if _, _, err := parseHotkeyCombo(hc.Combo); err != nil {
+			return fmt.Errorf("hotkey %q: %w", action, err)
+		}
+	}
+	return nil
+}
+
 // LoadOrCreate loads the key config from dataDir, creating a default one if missing.
 // Returns the config, config file path, and any error.
 func LoadOrCreate(dataDir string) (KeyConfig, string, error) {

@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Ameight/systray-queue-app/internal/hotkeys"
 	"github.com/Ameight/systray-queue-app/internal/queue"
 	"github.com/Ameight/systray-queue-app/internal/ui"
 	"github.com/Ameight/systray-queue-app/internal/util"
@@ -28,10 +29,17 @@ type Server struct {
 	once sync.Once
 	url  string
 	err  error
+
+	reloadHotkeys func()
 }
 
 func New(q *queue.TaskQueue, baseDir string) *Server {
 	return &Server{q: q, baseDir: baseDir}
+}
+
+// SetReloadFn sets a callback that is invoked after hotkey config is saved.
+func (s *Server) SetReloadFn(fn func()) {
+	s.reloadHotkeys = fn
 }
 
 func (s *Server) URL() (string, error) {
@@ -56,6 +64,8 @@ func (s *Server) start() (string, error) {
 	mux.HandleFunc("/view", s.handleView)
 	mux.HandleFunc("/action", s.handleAction)
 	mux.HandleFunc("/attachment", s.handleAttachment)
+	mux.HandleFunc("/settings", s.handleSettings)
+	mux.HandleFunc("/settings/save", s.handleSettingsSave)
 
 	srv := &http.Server{
 		Handler:           mux,
@@ -336,7 +346,7 @@ func renderManageHTML(tasks []queue.Task) string {
         .hint{font-size:12px;color:#666;margin-top:10px}
     </style></head><body>`)
 	b.WriteString(`<h1>Manage queue</h1>`)
-	b.WriteString(`<div class="row"><button id="save">Save order</button><button onclick="location.href='/add'">Add</button><button onclick="location.href='/view'">View</button><span id="status"></span></div>`)
+	b.WriteString(`<div class="row"><button id="save">Save order</button><button onclick="location.href='/add'">Add</button><button onclick="location.href='/view'">View</button><button onclick="location.href='/settings'">Settings</button><span id="status"></span></div>`)
 	b.WriteString(`<ul id="list">`)
 	for i, t := range tasks {
 		prev := t.Text
@@ -412,6 +422,133 @@ func renderManageHTML(tasks []queue.Task) string {
         });
     </script>`)
 	b.WriteString(`</body></html>`)
+	return b.String()
+}
+
+func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	cfg, _, err := hotkeys.LoadOrCreate(s.baseDir)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	page := ui.RenderPage("Settings", renderSettingsHTML(cfg))
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	io.WriteString(w, page)
+}
+
+func (s *Server) handleSettingsSave(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var cfg hotkeys.KeyConfig
+	if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
+		http.Error(w, "bad json: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if cfg.Version == 0 {
+		cfg.Version = 1
+	}
+	if err := hotkeys.Validate(cfg); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := hotkeys.Save(s.baseDir, cfg); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if s.reloadHotkeys != nil {
+		go s.reloadHotkeys()
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	io.WriteString(w, `{"ok":true}`)
+}
+
+// hotkeyMeta defines display order and labels for hotkey actions.
+var hotkeyMeta = []struct {
+	Key   string
+	Label string
+}{
+	{"show_first", "View current task"},
+	{"add_from_clipboard", "Add task (advanced)"},
+	{"skip", "Skip task"},
+	{"complete", "Complete task"},
+	{"manage_queue", "Manage queue"},
+}
+
+func renderSettingsHTML(cfg hotkeys.KeyConfig) string {
+	esc := func(s string) string {
+		return strings.NewReplacer(`"`, "&quot;", "&", "&amp;", "<", "&lt;").Replace(s)
+	}
+
+	var b strings.Builder
+	b.WriteString(`<h1>Settings</h1>`)
+	b.WriteString(`<h2 style="font-size:16px;margin:20px 0 10px">Hotkeys</h2>`)
+	b.WriteString(`<p class="muted">Modifiers: <code>ctrl</code>, <code>alt</code>, <code>shift</code>, <code>cmd</code> &nbsp;·&nbsp; Keys: <code>a</code>–<code>z</code>, <code>0</code>–<code>9</code>, <code>f1</code>–<code>f12</code></p>`)
+
+	b.WriteString(`<table style="border-collapse:collapse;width:100%;max-width:560px">`)
+	b.WriteString(`<thead><tr>`)
+	b.WriteString(`<th style="text-align:left;padding:8px 12px;border-bottom:2px solid #e0e0e0;font-weight:600">Action</th>`)
+	b.WriteString(`<th style="text-align:center;padding:8px 12px;border-bottom:2px solid #e0e0e0;font-weight:600">Enabled</th>`)
+	b.WriteString(`<th style="text-align:left;padding:8px 12px;border-bottom:2px solid #e0e0e0;font-weight:600">Shortcut</th>`)
+	b.WriteString(`</tr></thead><tbody>`)
+
+	for _, meta := range hotkeyMeta {
+		hc := cfg.Hotkeys[meta.Key]
+		checked := ""
+		if hc.Enabled {
+			checked = " checked"
+		}
+		combo := hc.Combo
+		b.WriteString(fmt.Sprintf(`<tr>
+  <td style="padding:10px 12px;border-bottom:1px solid #f0f0f0">%s</td>
+  <td style="padding:10px 12px;border-bottom:1px solid #f0f0f0;text-align:center">
+    <input type="checkbox" data-key="%s" class="hk-enabled"%s style="width:16px;height:16px;cursor:pointer">
+  </td>
+  <td style="padding:10px 12px;border-bottom:1px solid #f0f0f0">
+    <input type="text" data-key="%s" class="hk-combo" value="%s"
+      style="font-family:monospace;padding:6px 10px;border:1px solid #ccc;border-radius:6px;width:180px">
+  </td>
+</tr>`, meta.Label, esc(meta.Key), checked, esc(meta.Key), esc(combo)))
+	}
+
+	b.WriteString(`</tbody></table>`)
+	b.WriteString(`<div class="row" style="margin-top:20px">`)
+	b.WriteString(`<button id="save-btn">Save</button>`)
+	b.WriteString(`<button onclick="location.href='/'">Back</button>`)
+	b.WriteString(`<span id="status" class="muted"></span>`)
+	b.WriteString(`</div>`)
+
+	b.WriteString(`<script>
+document.getElementById('save-btn').addEventListener('click', async () => {
+  const status = document.getElementById('status');
+  const hotkeys = {};
+  document.querySelectorAll('.hk-enabled').forEach(cb => {
+    const key = cb.dataset.key;
+    const combo = document.querySelector('.hk-combo[data-key="' + key + '"]').value.trim();
+    hotkeys[key] = { enabled: cb.checked, combo };
+  });
+  const body = JSON.stringify({ version: 1, hotkeys });
+  status.textContent = 'Saving…';
+  try {
+    const res = await fetch('/settings/save', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body,
+    });
+    if (!res.ok) throw new Error(await res.text());
+    status.textContent = 'Saved';
+    setTimeout(() => status.textContent = '', 2000);
+  } catch (err) {
+    status.textContent = 'Error: ' + err.message;
+  }
+});
+</script>`)
+
 	return b.String()
 }
 
