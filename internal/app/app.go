@@ -16,7 +16,10 @@ import (
 	"github.com/Ameight/systray-queue-app/internal/util"
 )
 
-func Run() {
+var favicon []byte
+
+func Run(faviconData []byte) {
+	favicon = faviconData
 	runtime.LockOSThread()
 	systray.Run(onReady, onExit)
 }
@@ -42,7 +45,7 @@ func onReady() {
 		return
 	}
 
-	mgr = manage.New(q, dataDir)
+	mgr = manage.New(q, dataDir, favicon)
 
 	systray.SetIcon(ui.MakeTemplateIcon())
 	systray.SetTitle("Queue")

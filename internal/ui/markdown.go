@@ -73,6 +73,7 @@ func RenderPage(title, body string) string {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>` + title + `</title>
+<link rel="icon" type="image/png" href="/favicon.png">
 <style>
   body{font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;line-height:1.6;padding:20px;max-width:860px;margin:0 auto;color:#1a1a1a}
   h1{font-size:20px;margin:0 0 16px}

@@ -27,6 +27,7 @@ import (
 type Server struct {
 	q       *queue.TaskQueue
 	baseDir string
+	favicon []byte
 
 	once sync.Once
 	url  string
@@ -35,8 +36,8 @@ type Server struct {
 	reloadHotkeys func() error
 }
 
-func New(q *queue.TaskQueue, baseDir string) *Server {
-	return &Server{q: q, baseDir: baseDir}
+func New(q *queue.TaskQueue, baseDir string, favicon []byte) *Server {
+	return &Server{q: q, baseDir: baseDir, favicon: favicon}
 }
 
 // SetReloadFn sets a callback that is invoked after hotkey config is saved.
@@ -60,6 +61,7 @@ func (s *Server) start() (string, error) {
 
 	mux := http.NewServeMux()
 
+	mux.HandleFunc("/favicon.png", s.handleFavicon)
 	mux.HandleFunc("/", s.handleManage)
 	mux.HandleFunc("/reorder", s.handleReorder)
 	mux.HandleFunc("/add", s.handleAdd)
@@ -80,6 +82,16 @@ func (s *Server) start() (string, error) {
 	go preloadWhisperModel(cfg.IsWhisperEnabled())
 
 	return "http://" + ln.Addr().String() + "/", nil
+}
+
+func (s *Server) handleFavicon(w http.ResponseWriter, r *http.Request) {
+	if len(s.favicon) == 0 {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "image/png")
+	w.Header().Set("Cache-Control", "max-age=86400")
+	w.Write(s.favicon)
 }
 
 func (s *Server) handleManage(w http.ResponseWriter, r *http.Request) {
@@ -450,6 +462,7 @@ func renderManageHTML(tasks []queue.Task) string {
 	b.WriteString(`<!doctype html><html><head><meta charset="utf-8">`)
 	b.WriteString(`<meta name="viewport" content="width=device-width, initial-scale=1">`)
 	b.WriteString(`<title>Manage queue</title>`)
+	b.WriteString(`<link rel="icon" type="image/png" href="/favicon.png">`)
 	b.WriteString(`<style>
         body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,Noto Sans,sans-serif;margin:20px;max-width:900px}
         h1{font-size:20px;margin:0 0 12px}
