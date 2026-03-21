@@ -76,7 +76,8 @@ func (s *Server) start() (string, error) {
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	go func() { _ = srv.Serve(ln) }()
-	go preloadWhisperModel()
+	cfg, _, _ := hotkeys.LoadOrCreate(s.baseDir)
+	go preloadWhisperModel(cfg.IsWhisperEnabled())
 
 	return "http://" + ln.Addr().String() + "/", nil
 }
@@ -124,7 +125,8 @@ func (s *Server) handleAdd(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	page := ui.RenderPage("Add task", renderAddHTML())
+	cfg, _, _ := hotkeys.LoadOrCreate(s.baseDir)
+	page := ui.RenderPage("Add task", renderAddHTML(cfg.IsWhisperEnabled()))
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	io.WriteString(w, page)
 }
@@ -139,10 +141,6 @@ func (s *Server) handleAddSubmit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	text := strings.TrimSpace(r.FormValue("text"))
-	if text == "" {
-		http.Error(w, "text is required", http.StatusBadRequest)
-		return
-	}
 
 	var attachmentPath string
 	var attachmentType queue.AttachmentType = queue.AttachmentNone
@@ -170,6 +168,12 @@ func (s *Server) handleAddSubmit(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
+	}
+
+	// Text is required only when there is no attachment.
+	if text == "" && attachmentPath == "" {
+		http.Error(w, "text or attachment required", http.StatusBadRequest)
+		return
 	}
 
 	t := queue.Task{
@@ -227,31 +231,27 @@ func (s *Server) handleView(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// For image/audio attachments uploaded via the browser, serve via /attachment endpoint.
+	// Embed image/audio via /attachment endpoint so the browser can load them.
 	taskText := t.Text
-	if t.AttachmentType == queue.AttachmentImage && t.AttachmentPath != "" {
+	if t.AttachmentPath != "" {
 		name := filepath.Base(t.AttachmentPath)
-		imgURL := "/attachment?name=" + url.QueryEscape(name)
-		taskText += "\n\n![attachment](" + imgURL + ")\n"
+		switch t.AttachmentType {
+		case queue.AttachmentImage:
+			taskText += "\n\n![attachment](/attachment?name=" + url.QueryEscape(name) + ")\n"
+		case queue.AttachmentAudio:
+			taskText += "\n\n<audio controls src=\"/attachment?name=" + url.QueryEscape(name) + "\"></audio>\n"
+		}
 	}
 
+	// Pass AttachmentNone so RenderTaskHTML does not add its own file:// audio tag.
 	frag, err := ui.RenderTaskHTML(queue.Task{
-		ID:             t.ID,
-		Text:           taskText,
-		CreatedAt:      t.CreatedAt,
-		AttachmentPath: t.AttachmentPath,
-		AttachmentType: t.AttachmentType,
+		ID:        t.ID,
+		Text:      taskText,
+		CreatedAt: t.CreatedAt,
 	})
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
-	}
-
-	// For audio, override the file:// URL with a server-relative one.
-	if t.AttachmentType == queue.AttachmentAudio && t.AttachmentPath != "" {
-		name := filepath.Base(t.AttachmentPath)
-		audioTag := fmt.Sprintf(`<audio controls src="/attachment?name=%s"></audio>`, url.QueryEscape(name))
-		frag += "\n" + audioTag
 	}
 
 	body := fmt.Sprintf(`<h1>Current task</h1>
@@ -326,17 +326,15 @@ func (s *Server) handleAttachment(w http.ResponseWriter, r *http.Request) {
 	http.ServeFile(w, r, path)
 }
 
-func renderAddHTML() string {
-	return `<h1>Add task</h1>
-<form id="task-form" action="/add_submit" method="post" enctype="multipart/form-data">
-  <div class="row">
-    <button type="submit">Save</button>
-    <button type="button" onclick="location.href='/view'">Cancel</button>
-  </div>
-  <p class="muted">Markdown supported. You can attach an image or record a voice note (requires <a href="https://github.com/openai/whisper" target="_blank">whisper</a>).</p>
-  <p><textarea name="text" id="task-text" placeholder="Write task in Markdown..."></textarea></p>
-  <p><label>Attachment: <input type="file" name="attachment" accept="image/*,audio/*" /></label></p>
+func renderAddHTML(whisperEnabled bool) string {
+	hint := `Markdown supported. You can attach an image or audio file.`
+	if whisperEnabled {
+		hint = `Markdown supported. You can attach an image or record a voice note (requires <a href="https://github.com/openai/whisper" target="_blank">whisper</a>).`
+	}
 
+	recSection := ""
+	if whisperEnabled {
+		recSection = `
   <div style="margin-top:12px">
     <div class="row">
       <button type="button" id="rec-btn">Record voice note</button>
@@ -344,9 +342,6 @@ func renderAddHTML() string {
     </div>
     <div id="rec-player" style="display:none;margin-top:8px"></div>
   </div>
-
-  <input type="hidden" name="voice_attachment" id="voice-attachment-name" value="">
-</form>
 
 <script>
 (function(){
@@ -425,6 +420,19 @@ func renderAddHTML() string {
   });
 })();
 </script>`
+	}
+
+	return `<h1>Add task</h1>
+<form id="task-form" action="/add_submit" method="post" enctype="multipart/form-data">
+  <div class="row">
+    <button type="submit">Save</button>
+    <button type="button" onclick="location.href='/view'">Cancel</button>
+  </div>
+  <p class="muted">` + hint + `</p>
+  <p><textarea name="text" id="task-text" placeholder="Write task in Markdown..."></textarea></p>
+  <p><label>Attachment: <input type="file" name="attachment" accept="image/*,audio/*" /></label></p>
+  <input type="hidden" name="voice_attachment" id="voice-attachment-name" value="">` + recSection + `
+</form>`
 }
 
 func renderManageHTML(tasks []queue.Task) string {
@@ -614,7 +622,10 @@ func whisperCacheDir() string {
 // background at startup, so the first transcription does not stall waiting for
 // a download. Go's http.Client bypasses system proxy settings that can interfere
 // with Python's urllib.
-func preloadWhisperModel() {
+func preloadWhisperModel(enabled bool) {
+	if !enabled {
+		return
+	}
 	if _, err := exec.LookPath("whisper"); err != nil {
 		return // whisper not installed
 	}
@@ -832,6 +843,18 @@ func renderSettingsHTML(cfg hotkeys.KeyConfig) string {
 	}
 
 	b.WriteString(`</tbody></table>`)
+
+	// Whisper section
+	whisperChecked := ""
+	if cfg.IsWhisperEnabled() {
+		whisperChecked = " checked"
+	}
+	b.WriteString(`<h2 style="font-size:16px;margin:28px 0 10px">Voice transcription (Whisper)</h2>`)
+	b.WriteString(fmt.Sprintf(`<label style="display:flex;align-items:center;gap:10px;cursor:pointer">
+  <input type="checkbox" id="whisper-enabled"%s style="width:16px;height:16px;cursor:pointer">
+  Enable Whisper transcription (voice recording in Add task form)
+</label>`, whisperChecked))
+
 	b.WriteString(`<div class="row" style="margin-top:20px">`)
 	b.WriteString(`<button id="save-btn">Save</button>`)
 	b.WriteString(`<button onclick="location.href='/'">Back</button>`)
@@ -847,7 +870,8 @@ document.getElementById('save-btn').addEventListener('click', async () => {
     const combo = document.querySelector('.hk-combo[data-key="' + key + '"]').value.trim();
     hotkeys[key] = { enabled: cb.checked, combo };
   });
-  const body = JSON.stringify({ version: 1, hotkeys });
+  const whisperEnabled = document.getElementById('whisper-enabled').checked;
+  const body = JSON.stringify({ version: 1, whisper_enabled: whisperEnabled, hotkeys });
   status.textContent = 'Saving…';
   try {
     const res = await fetch('/settings/save', {

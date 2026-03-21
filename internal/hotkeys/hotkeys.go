@@ -30,8 +30,15 @@ type HotkeyConfig struct {
 }
 
 type KeyConfig struct {
-	Version int                     `yaml:"version" json:"version"`
-	Hotkeys map[string]HotkeyConfig `yaml:"hotkeys" json:"hotkeys"`
+	Version        int                     `yaml:"version"                    json:"version"`
+	WhisperEnabled *bool                   `yaml:"whisper_enabled,omitempty"  json:"whisper_enabled"`
+	Hotkeys        map[string]HotkeyConfig `yaml:"hotkeys"                    json:"hotkeys"`
+}
+
+// IsWhisperEnabled returns true if Whisper transcription is enabled.
+// Defaults to true when the field has never been set.
+func (cfg KeyConfig) IsWhisperEnabled() bool {
+	return cfg.WhisperEnabled == nil || *cfg.WhisperEnabled
 }
 
 type Registered struct {
@@ -39,9 +46,12 @@ type Registered struct {
 	HK     *hotkey.Hotkey
 }
 
+func boolPtr(b bool) *bool { return &b }
+
 func defaultKeyConfig() KeyConfig {
 	return KeyConfig{
-		Version: 1,
+		Version:        1,
+		WhisperEnabled: boolPtr(true),
 		Hotkeys: map[string]HotkeyConfig{
 			ActionShowFirst:        {Enabled: true, Combo: "ctrl+alt+q"},
 			ActionAddQuick:         {Enabled: true, Combo: "ctrl+alt+n"},
