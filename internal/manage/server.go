@@ -18,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Ameight/systray-queue-app/internal/autostart"
 	"github.com/Ameight/systray-queue-app/internal/hotkeys"
 	"github.com/Ameight/systray-queue-app/internal/queue"
 	"github.com/Ameight/systray-queue-app/internal/ui"
@@ -767,16 +768,22 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 	io.WriteString(w, page)
 }
 
+type settingsSaveRequest struct {
+	hotkeys.KeyConfig
+	AutostartEnabled *bool `json:"autostart_enabled"`
+}
+
 func (s *Server) handleSettingsSave(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	var cfg hotkeys.KeyConfig
-	if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
+	var req settingsSaveRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "bad json: "+err.Error(), http.StatusBadRequest)
 		return
 	}
+	cfg := req.KeyConfig
 	if cfg.Version == 0 {
 		cfg.Version = 1
 	}
@@ -792,6 +799,16 @@ func (s *Server) handleSettingsSave(w http.ResponseWriter, r *http.Request) {
 		if err := s.reloadHotkeys(); err != nil {
 			http.Error(w, "reload failed: "+err.Error(), http.StatusInternalServerError)
 			return
+		}
+	}
+	if req.AutostartEnabled != nil {
+		exePath, err := os.Executable()
+		if err == nil {
+			if *req.AutostartEnabled {
+				_ = autostart.Enable(exePath)
+			} else {
+				_ = autostart.Disable()
+			}
 		}
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -868,6 +885,17 @@ func renderSettingsHTML(cfg hotkeys.KeyConfig) string {
   Enable Whisper transcription (voice recording in Add task form)
 </label>`, whisperChecked))
 
+	// Autostart section
+	autostartChecked := ""
+	if autostart.IsEnabled() {
+		autostartChecked = " checked"
+	}
+	b.WriteString(`<h2 style="font-size:16px;margin:28px 0 10px">Autostart</h2>`)
+	b.WriteString(fmt.Sprintf(`<label style="display:flex;align-items:center;gap:10px;cursor:pointer">
+  <input type="checkbox" id="autostart-enabled"%s style="width:16px;height:16px;cursor:pointer">
+  Launch automatically when the system starts
+</label>`, autostartChecked))
+
 	b.WriteString(`<div class="row" style="margin-top:20px">`)
 	b.WriteString(`<button id="save-btn">Save</button>`)
 	b.WriteString(`<button onclick="location.href='/'">Back</button>`)
@@ -884,7 +912,8 @@ document.getElementById('save-btn').addEventListener('click', async () => {
     hotkeys[key] = { enabled: cb.checked, combo };
   });
   const whisperEnabled = document.getElementById('whisper-enabled').checked;
-  const body = JSON.stringify({ version: 1, whisper_enabled: whisperEnabled, hotkeys });
+  const autostartEnabled = document.getElementById('autostart-enabled').checked;
+  const body = JSON.stringify({ version: 1, whisper_enabled: whisperEnabled, hotkeys, autostart_enabled: autostartEnabled });
   status.textContent = 'Saving…';
   try {
     const res = await fetch('/settings/save', {
