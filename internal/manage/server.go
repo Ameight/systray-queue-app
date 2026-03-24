@@ -73,6 +73,12 @@ func (s *Server) start() (string, error) {
 	mux.HandleFunc("/settings", s.handleSettings)
 	mux.HandleFunc("/settings/save", s.handleSettingsSave)
 	mux.HandleFunc("/transcribe", s.handleTranscribe)
+	mux.HandleFunc("/task_preview", s.handleTaskPreview)
+	mux.HandleFunc("/task_raw", s.handleTaskRaw)
+	mux.HandleFunc("/task_update", s.handleTaskUpdate)
+	mux.HandleFunc("/history", s.handleHistory)
+	mux.HandleFunc("/history/delete", s.handleHistoryDelete)
+	mux.HandleFunc("/history/clear", s.handleHistoryClear)
 
 	srv := &http.Server{
 		Handler:           mux,
@@ -273,6 +279,7 @@ func (s *Server) handleView(w http.ResponseWriter, r *http.Request) {
   <button onclick="doAction('skip')">Skip</button>
   <button onclick="location.href='/add'">Add</button>
   <button onclick="location.href='/'">Manage order</button>
+  <button onclick="location.href='/history'">History</button>
 </div>
 <div class="card">%s</div>
 <script>
@@ -465,45 +472,75 @@ func renderManageHTML(tasks []queue.Task) string {
 	b.WriteString(`<title>Manage queue</title>`)
 	b.WriteString(`<link rel="icon" type="image/png" href="/favicon.png">`)
 	b.WriteString(`<style>
-        body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,Noto Sans,sans-serif;margin:20px;max-width:900px}
-        h1{font-size:20px;margin:0 0 12px}
-        .row{display:flex;gap:10px;align-items:center;margin:12px 0;flex-wrap:wrap}
-        button{padding:8px 12px;border-radius:8px;border:1px solid #ccc;background:#fff;cursor:pointer}
+        *{box-sizing:border-box}
+        body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,Noto Sans,sans-serif;margin:0;padding:16px;height:100vh;display:flex;flex-direction:column;overflow:hidden}
+        h1{font-size:20px;margin:0 0 10px}
+        .row{display:flex;gap:10px;align-items:center;margin:0 0 10px;flex-wrap:wrap}
+        button{padding:8px 12px;border-radius:8px;border:1px solid #ccc;background:#fff;cursor:pointer;font-size:14px}
         button:hover{background:#f5f5f5}
+        button.primary{background:#1a73e8;color:#fff;border-color:#1a73e8}
+        button.primary:hover{background:#1558b0}
         #status{font-size:12px;color:#666}
-        ul{list-style:none;padding:0;margin:0;border:1px solid #ddd;border-radius:12px;overflow:hidden}
-        li{padding:10px 12px;border-bottom:1px solid #eee;cursor:grab;background:#fff}
+        .main{display:flex;gap:16px;flex:1;min-height:0}
+        .left-panel{width:320px;flex-shrink:0;display:flex;flex-direction:column;min-height:0}
+        .right-panel{flex:1;border:1px solid #ddd;border-radius:12px;overflow:auto;padding:16px;background:#fafafa;min-width:0}
+        ul{list-style:none;padding:0;margin:0;border:1px solid #ddd;border-radius:12px;overflow-y:auto;flex:1}
+        li{padding:10px 12px;border-bottom:1px solid #eee;cursor:grab;background:#fff;user-select:none;font-size:14px}
         li:last-child{border-bottom:none}
+        li:hover{background:#f8f8f8}
+        li.selected{background:#e8f0fe;border-left:3px solid #1a73e8;padding-left:9px}
         li.dragging{opacity:.5}
         li.over{outline:2px dashed #999;outline-offset:-2px}
-        .hint{font-size:12px;color:#666;margin-top:10px}
+        .hint{font-size:12px;color:#888;margin-top:8px}
+        .muted{color:#888;font-size:14px}
+        .empty-hint{color:#bbb;font-size:15px;display:flex;align-items:center;justify-content:center;height:100%;text-align:center}
+        .preview-bar{display:flex;gap:8px;align-items:center;margin-bottom:12px;flex-wrap:wrap}
+        textarea.edit-area{width:100%;min-height:260px;font-family:inherit;font-size:14px;padding:10px;border:1px solid #ccc;border-radius:8px;resize:vertical}
+        img{max-width:100%;height:auto;border-radius:8px;border:1px solid #ddd}
+        pre,code{background:#f6f8fa;border-radius:4px;padding:2px 4px}
+        pre code{padding:0}
+        pre{padding:12px}
+        audio{width:100%;margin:8px 0}
     </style></head><body>`)
 	b.WriteString(`<h1>Manage queue</h1>`)
-	b.WriteString(`<div class="row"><button id="save">Save order</button><button onclick="location.href='/add'">Add</button><button onclick="location.href='/view'">View</button><button onclick="location.href='/settings'">Settings</button><span id="status"></span></div>`)
+	b.WriteString(`<div class="row"><button id="save">Save order</button><button onclick="location.href='/add'">Add</button><button onclick="location.href='/view'">View</button><button onclick="location.href='/history'">History</button><button onclick="location.href='/settings'">Settings</button><span id="status"></span></div>`)
+	b.WriteString(`<div class="main">`)
+	b.WriteString(`<div class="left-panel">`)
 	b.WriteString(`<ul id="list">`)
 	for i, t := range tasks {
 		prev := t.Text
 		if idx := strings.IndexByte(prev, '\n'); idx >= 0 {
 			prev = prev[:idx]
 		}
-		if len(prev) > 140 {
-			prev = prev[:140] + "…"
+		if len(prev) > 100 {
+			prev = prev[:100] + "…"
 		}
-		b.WriteString(fmt.Sprintf(`<li draggable="true" data-idx="%d">%d. %s</li>`, i, i+1, esc(prev)))
+		b.WriteString(fmt.Sprintf(`<li draggable="true" data-idx="%d" data-id="%s">%d. %s</li>`, i, esc(t.ID), i+1, esc(prev)))
 	}
 	b.WriteString(`</ul>`)
-	b.WriteString(`<div class="hint">Drag tasks to reorder. Click Save to persist.</div>`)
+	b.WriteString(`<div class="hint">Drag to reorder · Click to preview</div>`)
+	b.WriteString(`</div>`)
+	b.WriteString(`<div class="right-panel" id="preview-panel"><div class="empty-hint">← Click a task to preview it</div></div>`)
+	b.WriteString(`</div>`)
 	b.WriteString(`<script>
         const list = document.getElementById('list');
         const status = document.getElementById('status');
+        const panel = document.getElementById('preview-panel');
         let dragging = null;
+        let dragMoved = false;
+        let selectedLi = null;
+        let currentId = null;
 
         function setStatus(msg){ status.textContent = msg || ''; }
 
+        function escHTML(s){ return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+
+        // ── Drag & drop ──────────────────────────────────────────────────────
         list.addEventListener('dragstart', (e) => {
             const li = e.target.closest('li');
             if (!li) return;
             dragging = li;
+            dragMoved = true;
             li.classList.add('dragging');
             e.dataTransfer.effectAllowed = 'move';
             e.dataTransfer.setData('text/plain', li.dataset.idx);
@@ -515,6 +552,7 @@ func renderManageHTML(tasks []queue.Task) string {
             li.classList.remove('dragging');
             [...list.querySelectorAll('li.over')].forEach(x => x.classList.remove('over'));
             dragging = null;
+            setTimeout(() => { dragMoved = false; }, 50);
         });
 
         list.addEventListener('dragover', (e) => {
@@ -522,14 +560,9 @@ func renderManageHTML(tasks []queue.Task) string {
             const over = e.target.closest('li');
             if (!over || !dragging || over === dragging) return;
             over.classList.add('over');
-
             const rect = over.getBoundingClientRect();
             const before = (e.clientY - rect.top) < rect.height / 2;
-            if (before) {
-                list.insertBefore(dragging, over);
-            } else {
-                list.insertBefore(dragging, over.nextSibling);
-            }
+            list.insertBefore(dragging, before ? over : over.nextSibling);
         });
 
         list.addEventListener('dragleave', (e) => {
@@ -537,6 +570,96 @@ func renderManageHTML(tasks []queue.Task) string {
             if (li) li.classList.remove('over');
         });
 
+        // ── Click to preview ─────────────────────────────────────────────────
+        list.addEventListener('click', (e) => {
+            if (dragMoved) return;
+            const li = e.target.closest('li');
+            if (!li) return;
+            openPreview(li);
+        });
+
+        async function openPreview(li) {
+            if (selectedLi) selectedLi.classList.remove('selected');
+            selectedLi = li;
+            li.classList.add('selected');
+            currentId = li.dataset.id;
+            panel.innerHTML = '<div class="muted">Loading…</div>';
+            try {
+                const res = await fetch('/task_preview?id=' + encodeURIComponent(currentId));
+                if (!res.ok) throw new Error(await res.text());
+                showPreview(await res.text());
+            } catch (err) {
+                panel.innerHTML = '<div class="muted">Error: ' + escHTML(err.message) + '</div>';
+            }
+        }
+
+        function showPreview(html) {
+            panel.innerHTML =
+                '<div class="preview-bar">' +
+                  '<button onclick="enterEdit()">Edit</button>' +
+                '</div>' +
+                '<div id="preview-content">' + html + '</div>';
+        }
+
+        async function enterEdit() {
+            panel.innerHTML = '<div class="muted">Loading…</div>';
+            try {
+                const res = await fetch('/task_raw?id=' + encodeURIComponent(currentId));
+                if (!res.ok) throw new Error(await res.text());
+                const data = await res.json();
+                showEdit(data.text);
+            } catch (err) {
+                panel.innerHTML = '<div class="muted">Error: ' + escHTML(err.message) + '</div>';
+            }
+        }
+
+        function showEdit(text) {
+            panel.innerHTML =
+                '<div class="preview-bar">' +
+                  '<button class="primary" onclick="saveEdit()">Save</button>' +
+                  '<button onclick="cancelEdit()">Cancel</button>' +
+                  '<span id="edit-status" class="muted" style="margin-left:6px"></span>' +
+                '</div>' +
+                '<textarea class="edit-area" id="edit-ta">' + escHTML(text) + '</textarea>';
+            document.getElementById('edit-ta').focus();
+        }
+
+        async function saveEdit() {
+            const text = document.getElementById('edit-ta').value;
+            const s = document.getElementById('edit-status');
+            s.textContent = 'Saving…';
+            try {
+                const res = await fetch('/task_update', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({id: currentId, text})
+                });
+                if (!res.ok) throw new Error(await res.text());
+                // update list item label
+                if (selectedLi) {
+                    let first = text.split('\n')[0];
+                    const truncated = first.length > 100;
+                    if (truncated) first = first.slice(0, 100);
+                    const idx = parseInt(selectedLi.dataset.idx, 10);
+                    selectedLi.textContent = (idx + 1) + '. ' + first + (truncated ? '…' : '');
+                    selectedLi.dataset.idx = selectedLi.dataset.idx; // keep attrs
+                }
+                const r2 = await fetch('/task_preview?id=' + encodeURIComponent(currentId));
+                if (r2.ok) showPreview(await r2.text());
+            } catch (err) {
+                document.getElementById('edit-status').textContent = 'Error: ' + escHTML(err.message);
+            }
+        }
+
+        async function cancelEdit() {
+            try {
+                const res = await fetch('/task_preview?id=' + encodeURIComponent(currentId));
+                if (res.ok) { showPreview(await res.text()); return; }
+            } catch(_) {}
+            panel.innerHTML = '<div class="empty-hint">← Click a task to preview it</div>';
+        }
+
+        // ── Save order ───────────────────────────────────────────────────────
         document.getElementById('save').addEventListener('click', async () => {
             const order = [...list.querySelectorAll('li')].map(li => parseInt(li.dataset.idx, 10));
             setStatus('Saving…');
@@ -548,7 +671,7 @@ func renderManageHTML(tasks []queue.Task) string {
                 });
                 if (!res.ok) throw new Error(await res.text());
                 setStatus('Saved');
-                setTimeout(()=>setStatus(''), 1200);
+                setTimeout(() => setStatus(''), 1200);
             } catch (err) {
                 setStatus('Error: ' + err.message);
             }
@@ -556,6 +679,77 @@ func renderManageHTML(tasks []queue.Task) string {
     </script>`)
 	b.WriteString(`</body></html>`)
 	return b.String()
+}
+
+func (s *Server) handleTaskPreview(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	id := r.URL.Query().Get("id")
+	t, ok := s.q.GetByID(id)
+	if !ok {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	taskText := t.Text
+	if t.AttachmentPath != "" {
+		name := filepath.Base(t.AttachmentPath)
+		switch t.AttachmentType {
+		case queue.AttachmentImage:
+			taskText += "\n\n![attachment](/attachment?name=" + url.QueryEscape(name) + ")\n"
+		case queue.AttachmentAudio:
+			taskText += "\n\n<audio controls src=\"/attachment?name=" + url.QueryEscape(name) + "\"></audio>\n"
+		}
+	}
+	frag, err := ui.RenderTaskHTML(queue.Task{ID: t.ID, Text: taskText, CreatedAt: t.CreatedAt})
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	io.WriteString(w, frag)
+}
+
+func (s *Server) handleTaskRaw(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	id := r.URL.Query().Get("id")
+	t, ok := s.q.GetByID(id)
+	if !ok {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	data, _ := json.Marshal(map[string]string{"text": t.Text})
+	w.Write(data)
+}
+
+func (s *Server) handleTaskUpdate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		ID   string `json:"id"`
+		Text string `json:"text"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad json", http.StatusBadRequest)
+		return
+	}
+	if req.ID == "" {
+		http.Error(w, "id required", http.StatusBadRequest)
+		return
+	}
+	if err := s.q.UpdateText(req.ID, req.Text); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	io.WriteString(w, `{"ok":true}`)
 }
 
 // handleTranscribe receives a raw audio blob, saves it, transcribes with whisper,
@@ -928,6 +1122,207 @@ document.getElementById('save-btn').addEventListener('click', async () => {
     status.textContent = 'Error: ' + err.message;
   }
 });
+</script>`)
+
+	return b.String()
+}
+
+func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	entries := s.q.History().GetAll()
+	page := ui.RenderPage("History", renderHistoryHTML(entries))
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	io.WriteString(w, page)
+}
+
+func (s *Server) handleHistoryDelete(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad json", http.StatusBadRequest)
+		return
+	}
+	if err := s.q.History().DeleteByID(req.ID); err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	io.WriteString(w, `{"ok":true}`)
+}
+
+func (s *Server) handleHistoryClear(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := s.q.History().Clear(); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	io.WriteString(w, `{"ok":true}`)
+}
+
+func renderHistoryHTML(entries []queue.Task) string {
+	esc := func(s string) string {
+		return strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;", `"`, "&quot;").Replace(s)
+	}
+	fmtDuration := func(d time.Duration) string {
+		d = d.Round(time.Second)
+		if d < time.Minute {
+			return fmt.Sprintf("%ds", int(d.Seconds()))
+		}
+		if d < time.Hour {
+			return fmt.Sprintf("%dm", int(d.Minutes()))
+		}
+		h := int(d.Hours())
+		m := int(d.Minutes()) % 60
+		if m == 0 {
+			return fmt.Sprintf("%dh", h)
+		}
+		return fmt.Sprintf("%dh %dm", h, m)
+	}
+	fmtTime := func(t time.Time) string {
+		return t.Local().Format("15:04")
+	}
+	fmtDate := func(t time.Time) string {
+		return t.Local().Format("02 Jan 2006")
+	}
+
+	// Group entries by calendar day (local time).
+	type group struct {
+		label   string
+		entries []queue.Task
+	}
+	var groups []group
+	dayKey := func(t time.Time) string { return t.Local().Format("2006-01-02") }
+	now := time.Now()
+	today := dayKey(now)
+	yesterday := dayKey(now.AddDate(0, 0, -1))
+	weekAgo := now.AddDate(0, 0, -6)
+
+	groupMap := map[string]*group{}
+	var groupOrder []string
+	for _, e := range entries {
+		ref := e.CompletedAt
+		if ref.IsZero() {
+			ref = e.CreatedAt
+		}
+		key := dayKey(ref)
+		if _, ok := groupMap[key]; !ok {
+			var label string
+			switch key {
+			case today:
+				label = "Сегодня"
+			case yesterday:
+				label = "Вчера"
+			default:
+				if ref.After(weekAgo) {
+					label = ref.Local().Format("Monday, 02 Jan")
+				} else {
+					label = fmtDate(ref)
+				}
+			}
+			groupMap[key] = &group{label: label}
+			groupOrder = append(groupOrder, key)
+		}
+		groupMap[key].entries = append(groupMap[key].entries, e)
+	}
+	for _, k := range groupOrder {
+		groups = append(groups, *groupMap[k])
+	}
+
+	var b strings.Builder
+	if len(entries) == 0 {
+		b.WriteString(`<p class="muted">История пуста.</p>`)
+		b.WriteString(`<div class="row"><button onclick="location.href='/'">Назад</button></div>`)
+		return b.String()
+	}
+
+	b.WriteString(`<div class="row" style="margin-bottom:16px">`)
+	b.WriteString(`<button onclick="location.href='/'">← Назад</button>`)
+	b.WriteString(`<button id="clear-all" style="color:#c00;border-color:#c00">Очистить всю историю</button>`)
+	b.WriteString(`</div>`)
+
+	for _, g := range groups {
+		b.WriteString(fmt.Sprintf(`<h2 style="font-size:15px;margin:20px 0 8px;color:#555">%s</h2>`, esc(g.label)))
+		b.WriteString(`<div class="history-group">`)
+		for _, e := range g.entries {
+			// Preview: first non-empty line, truncated.
+			preview := e.Text
+			if idx := strings.IndexByte(preview, '\n'); idx >= 0 {
+				preview = preview[:idx]
+			}
+			preview = strings.TrimSpace(preview)
+			if len(preview) > 120 {
+				preview = preview[:120] + "…"
+			}
+
+			var timeLine string
+			if !e.StartedAt.IsZero() && !e.CompletedAt.IsZero() {
+				dur := fmtDuration(e.CompletedAt.Sub(e.StartedAt))
+				timeLine = fmt.Sprintf(`<span class="ts">Начало: %s · Конец: %s · %s</span>`,
+					fmtTime(e.StartedAt), fmtTime(e.CompletedAt), dur)
+			} else if !e.CompletedAt.IsZero() {
+				timeLine = fmt.Sprintf(`<span class="ts">Завершено: %s</span>`, fmtTime(e.CompletedAt))
+			} else {
+				timeLine = fmt.Sprintf(`<span class="ts">Создано: %s</span>`, fmtTime(e.CreatedAt))
+			}
+
+			b.WriteString(fmt.Sprintf(`<div class="history-item" data-id="%s">`, esc(e.ID)))
+			b.WriteString(fmt.Sprintf(`<div class="history-text">%s</div>`, esc(preview)))
+			b.WriteString(fmt.Sprintf(`<div class="history-meta">%s<button class="del-btn" data-id="%s">×</button></div>`, timeLine, esc(e.ID)))
+			b.WriteString(`</div>`)
+		}
+		b.WriteString(`</div>`)
+	}
+
+	b.WriteString(`<style>
+.history-group{display:flex;flex-direction:column;gap:4px}
+.history-item{background:#fff;border:1px solid #e8e8e8;border-radius:8px;padding:10px 12px;display:flex;flex-direction:column;gap:4px}
+.history-text{font-size:14px;line-height:1.4}
+.history-meta{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.ts{font-size:12px;color:#888}
+.del-btn{background:none;border:none;cursor:pointer;font-size:16px;color:#bbb;padding:0 4px;line-height:1;border-radius:4px}
+.del-btn:hover{color:#c00;background:#fff0f0}
+</style>`)
+
+	b.WriteString(`<script>
+document.querySelectorAll('.del-btn').forEach(btn => {
+  btn.addEventListener('click', async () => {
+    const id = btn.dataset.id;
+    const item = document.querySelector('.history-item[data-id="' + id + '"]');
+    try {
+      const res = await fetch('/history/delete', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({id})
+      });
+      if (!res.ok) throw new Error(await res.text());
+      item.remove();
+    } catch (e) { alert('Ошибка: ' + e.message); }
+  });
+});
+
+const clearBtn = document.getElementById('clear-all');
+if (clearBtn) {
+  clearBtn.addEventListener('click', async () => {
+    if (!confirm('Удалить всю историю?')) return;
+    try {
+      const res = await fetch('/history/clear', {method: 'POST'});
+      if (!res.ok) throw new Error(await res.text());
+      location.reload();
+    } catch (e) { alert('Ошибка: ' + e.message); }
+  });
+}
 </script>`)
 
 	return b.String()

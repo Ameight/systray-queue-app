@@ -23,8 +23,87 @@ type Task struct {
 	ID             string         `json:"id"`
 	Text           string         `json:"text"`
 	CreatedAt      time.Time      `json:"created_at"`
+	StartedAt      time.Time      `json:"started_at,omitempty"`
+	CompletedAt    time.Time      `json:"completed_at,omitempty"`
 	AttachmentPath string         `json:"attachment_path,omitempty"`
 	AttachmentType AttachmentType `json:"attachment_type,omitempty"`
+}
+
+type TaskHistory struct {
+	mu       sync.Mutex
+	Entries  []Task `json:"entries"`
+	filePath string
+}
+
+func NewTaskHistory(baseDir string) (*TaskHistory, error) {
+	h := &TaskHistory{filePath: filepath.Join(baseDir, "history.json")}
+	if err := h.load(); err != nil {
+		return nil, err
+	}
+	return h, nil
+}
+
+func (h *TaskHistory) load() error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	b, err := os.ReadFile(h.filePath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			h.Entries = nil
+			return nil
+		}
+		return err
+	}
+	var tmp struct {
+		Entries []Task `json:"entries"`
+	}
+	if err := json.Unmarshal(b, &tmp); err != nil {
+		return err
+	}
+	h.Entries = tmp.Entries
+	return nil
+}
+
+func (h *TaskHistory) saveLocked() error {
+	data, err := json.MarshalIndent(h, "", "  ")
+	if err != nil {
+		return err
+	}
+	return atomicWriteFile(h.filePath, data, 0644)
+}
+
+func (h *TaskHistory) Add(t Task) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.Entries = append([]Task{t}, h.Entries...)
+	return h.saveLocked()
+}
+
+func (h *TaskHistory) GetAll() []Task {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	res := make([]Task, len(h.Entries))
+	copy(res, h.Entries)
+	return res
+}
+
+func (h *TaskHistory) DeleteByID(id string) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for i, e := range h.Entries {
+		if e.ID == id {
+			h.Entries = append(h.Entries[:i], h.Entries[i+1:]...)
+			return h.saveLocked()
+		}
+	}
+	return fmt.Errorf("history entry not found: %s", id)
+}
+
+func (h *TaskHistory) Clear() error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.Entries = nil
+	return h.saveLocked()
 }
 
 type TaskQueue struct {
@@ -32,6 +111,7 @@ type TaskQueue struct {
 	Tasks          []Task `json:"tasks"`
 	filePath       string
 	attachmentsDir string
+	history        *TaskHistory
 }
 
 func NewTaskQueue(baseDir string) (*TaskQueue, error) {
@@ -42,10 +122,19 @@ func NewTaskQueue(baseDir string) (*TaskQueue, error) {
 	if err := os.MkdirAll(q.attachmentsDir, 0o755); err != nil {
 		return nil, err
 	}
+	history, err := NewTaskHistory(baseDir)
+	if err != nil {
+		return nil, err
+	}
+	q.history = history
 	if err := q.loadLocked(); err != nil {
 		return nil, err
 	}
 	return q, nil
+}
+
+func (q *TaskQueue) History() *TaskHistory {
+	return q.history
 }
 
 func (q *TaskQueue) AttachmentsDir() string {
@@ -84,6 +173,9 @@ func (q *TaskQueue) saveLocked() error {
 func (q *TaskQueue) Enqueue(t Task) error {
 	q.mu.Lock()
 	defer q.mu.Unlock()
+	if len(q.Tasks) == 0 {
+		t.StartedAt = time.Now()
+	}
 	q.Tasks = append(q.Tasks, t)
 	return q.saveLocked()
 }
@@ -126,10 +218,23 @@ func (q *TaskQueue) Complete() (Task, error) {
 	}
 
 	task := q.Tasks[0]
+	task.CompletedAt = time.Now()
+	if task.StartedAt.IsZero() {
+		task.StartedAt = task.CreatedAt
+	}
 	q.Tasks = q.Tasks[1:]
+
+	// The next task becomes active — mark when it started.
+	if len(q.Tasks) > 0 && q.Tasks[0].StartedAt.IsZero() {
+		q.Tasks[0].StartedAt = time.Now()
+	}
 
 	if err := q.saveLocked(); err != nil {
 		return Task{}, err
+	}
+
+	if q.history != nil {
+		_ = q.history.Add(task)
 	}
 
 	if task.AttachmentPath != "" && q.attachmentsDir != "" {
@@ -140,6 +245,29 @@ func (q *TaskQueue) Complete() (Task, error) {
 	}
 
 	return task, nil
+}
+
+func (q *TaskQueue) GetByID(id string) (Task, bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	for _, t := range q.Tasks {
+		if t.ID == id {
+			return t, true
+		}
+	}
+	return Task{}, false
+}
+
+func (q *TaskQueue) UpdateText(id, text string) error {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	for i := range q.Tasks {
+		if q.Tasks[i].ID == id {
+			q.Tasks[i].Text = text
+			return q.saveLocked()
+		}
+	}
+	return fmt.Errorf("task not found: %s", id)
 }
 
 func (q *TaskQueue) ReorderByIndices(order []int) error {
