@@ -1030,21 +1030,23 @@ func renderSettingsHTML(cfg hotkeys.KeyConfig) string {
 	var b strings.Builder
 	b.WriteString(`<h1>Settings</h1>`)
 	b.WriteString(`<h2 style="font-size:16px;margin:20px 0 10px">Hotkeys</h2>`)
-	b.WriteString(`<p class="muted">
-  Modifiers:
-  <code>ctrl</code> ⌃ &nbsp;·&nbsp;
-  <code>alt</code> / <code>option</code> ⌥ &nbsp;·&nbsp;
-  <code>shift</code> ⇧ &nbsp;·&nbsp;
-  <code>cmd</code> ⌘
-  &nbsp;&nbsp;|&nbsp;&nbsp;
-  Keys: <code>a</code>–<code>z</code>, <code>0</code>–<code>9</code>, <code>f1</code>–<code>f12</code>
-</p>`)
+	b.WriteString(`<p class="muted">Нажмите кнопку и введите сочетание клавиш. Escape — отмена.</p>`)
 
-	b.WriteString(`<table style="border-collapse:collapse;width:100%;max-width:560px">`)
-	b.WriteString(`<thead><tr>`)
-	b.WriteString(`<th style="text-align:left;padding:8px 12px;border-bottom:2px solid #e0e0e0;font-weight:600">Action</th>`)
-	b.WriteString(`<th style="text-align:center;padding:8px 12px;border-bottom:2px solid #e0e0e0;font-weight:600">Enabled</th>`)
-	b.WriteString(`<th style="text-align:left;padding:8px 12px;border-bottom:2px solid #e0e0e0;font-weight:600">Shortcut</th>`)
+	b.WriteString(`<style>
+.hk-table{border-collapse:collapse;width:100%;max-width:600px}
+.hk-table th{text-align:left;padding:8px 12px;border-bottom:2px solid #e0e0e0;font-weight:600;font-size:13px}
+.hk-table td{padding:10px 12px;border-bottom:1px solid #f0f0f0;vertical-align:middle}
+.hk-record{font-family:monospace;font-size:13px;padding:5px 12px;border:1px solid #ccc;border-radius:6px;background:#fff;cursor:pointer;min-width:160px;text-align:left}
+.hk-record:hover{background:#f5f5f5}
+.hk-record.listening{border-color:#1a73e8;background:#e8f0fe;color:#1a73e8;animation:pulse 1s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.6}}
+.hk-clear{background:none;border:none;cursor:pointer;color:#bbb;font-size:16px;padding:0 4px;line-height:1;border-radius:4px}
+.hk-clear:hover{color:#c00;background:#fff0f0}
+.hk-conflict{font-size:12px;color:#c00;margin-left:6px}
+</style>`)
+
+	b.WriteString(`<table class="hk-table"><thead><tr>`)
+	b.WriteString(`<th>Действие</th><th style="text-align:center">Вкл</th><th>Сочетание</th><th></th>`)
 	b.WriteString(`</tr></thead><tbody>`)
 
 	for _, meta := range hotkeyMeta {
@@ -1054,16 +1056,20 @@ func renderSettingsHTML(cfg hotkeys.KeyConfig) string {
 			checked = " checked"
 		}
 		combo := hc.Combo
-		b.WriteString(fmt.Sprintf(`<tr>
-  <td style="padding:10px 12px;border-bottom:1px solid #f0f0f0">%s</td>
-  <td style="padding:10px 12px;border-bottom:1px solid #f0f0f0;text-align:center">
-    <input type="checkbox" data-key="%s" class="hk-enabled"%s style="width:16px;height:16px;cursor:pointer">
+		if combo == "" {
+			combo = "—"
+		}
+		b.WriteString(fmt.Sprintf(`<tr data-key="%s">
+  <td>%s</td>
+  <td style="text-align:center">
+    <input type="checkbox" class="hk-enabled" data-key="%s"%s style="width:16px;height:16px;cursor:pointer">
   </td>
-  <td style="padding:10px 12px;border-bottom:1px solid #f0f0f0">
-    <input type="text" data-key="%s" class="hk-combo" value="%s"
-      style="font-family:monospace;padding:6px 10px;border:1px solid #ccc;border-radius:6px;width:180px">
+  <td>
+    <button class="hk-record" data-key="%s">%s</button>
+    <span class="hk-conflict" data-key="%s"></span>
   </td>
-</tr>`, meta.Label, esc(meta.Key), checked, esc(meta.Key), esc(combo)))
+  <td><button class="hk-clear" data-key="%s" title="Очистить">×</button></td>
+</tr>`, esc(meta.Key), meta.Label, esc(meta.Key), checked, esc(meta.Key), esc(combo), esc(meta.Key), esc(meta.Key)))
 	}
 
 	b.WriteString(`</tbody></table>`)
@@ -1097,31 +1103,141 @@ func renderSettingsHTML(cfg hotkeys.KeyConfig) string {
 	b.WriteString(`</div>`)
 
 	b.WriteString(`<script>
-document.getElementById('save-btn').addEventListener('click', async () => {
-  const status = document.getElementById('status');
-  const hotkeys = {};
-  document.querySelectorAll('.hk-enabled').forEach(cb => {
-    const key = cb.dataset.key;
-    const combo = document.querySelector('.hk-combo[data-key="' + key + '"]').value.trim();
-    hotkeys[key] = { enabled: cb.checked, combo };
+(function() {
+  // combos[key] = current combo string ('' means cleared)
+  const combos = {};
+  document.querySelectorAll('.hk-record').forEach(btn => {
+    const raw = btn.textContent.trim();
+    combos[btn.dataset.key] = raw === '—' ? '' : raw;
   });
-  const whisperEnabled = document.getElementById('whisper-enabled').checked;
-  const autostartEnabled = document.getElementById('autostart-enabled').checked;
-  const body = JSON.stringify({ version: 1, whisper_enabled: whisperEnabled, hotkeys, autostart_enabled: autostartEnabled });
-  status.textContent = 'Saving…';
-  try {
-    const res = await fetch('/settings/save', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body,
-    });
-    if (!res.ok) throw new Error(await res.text());
-    status.textContent = 'Saved';
-    setTimeout(() => status.textContent = '', 2000);
-  } catch (err) {
-    status.textContent = 'Error: ' + err.message;
+
+  let listeningKey = null;
+  let listeningBtn = null;
+
+  function codeToKey(code) {
+    if (code.startsWith('Key'))   return code.slice(3).toLowerCase();
+    if (code.startsWith('Digit')) return code.slice(5);
+    if (/^F\d{1,2}$/.test(code)) return code.toLowerCase();
+    return null;
   }
-});
+
+  function cancelListening() {
+    if (!listeningKey) return;
+    listeningBtn.textContent = combos[listeningKey] || '—';
+    listeningBtn.classList.remove('listening');
+    listeningKey = null;
+    listeningBtn = null;
+    document.removeEventListener('keydown', onKeyDown, true);
+  }
+
+  function onKeyDown(e) {
+    e.preventDefault();
+    e.stopPropagation();
+
+    const modOnly = ['Control','Alt','Shift','Meta'].includes(e.key);
+    if (modOnly) return;
+
+    if (e.key === 'Escape') { cancelListening(); return; }
+
+    const mods = [];
+    if (e.ctrlKey)  mods.push('ctrl');
+    if (e.altKey)   mods.push('alt');
+    if (e.shiftKey) mods.push('shift');
+    if (e.metaKey)  mods.push('cmd');
+
+    const k = codeToKey(e.code);
+    if (!k) return;
+
+    const combo = [...mods, k].join('+');
+    combos[listeningKey] = combo;
+    listeningBtn.textContent = combo;
+    listeningBtn.classList.remove('listening');
+    listeningKey = null;
+    listeningBtn = null;
+    document.removeEventListener('keydown', onKeyDown, true);
+    checkConflicts();
+  }
+
+  function checkConflicts() {
+    document.querySelectorAll('.hk-conflict').forEach(s => s.textContent = '');
+    const seen = {}; // combo → first key
+    document.querySelectorAll('.hk-enabled').forEach(cb => {
+      const key = cb.dataset.key;
+      const combo = combos[key] || '';
+      if (!cb.checked || !combo) return;
+      if (seen[combo] !== undefined) {
+        document.querySelector('.hk-conflict[data-key="' + seen[combo] + '"]').textContent = '⚠ конфликт';
+        document.querySelector('.hk-conflict[data-key="' + key + '"]').textContent = '⚠ конфликт';
+      } else {
+        seen[combo] = key;
+      }
+    });
+  }
+
+  // Record buttons
+  document.querySelectorAll('.hk-record').forEach(btn => {
+    btn.addEventListener('click', () => {
+      if (listeningKey === btn.dataset.key) { cancelListening(); return; }
+      cancelListening();
+      listeningKey = btn.dataset.key;
+      listeningBtn = btn;
+      btn.textContent = 'Нажмите клавиши…';
+      btn.classList.add('listening');
+      document.addEventListener('keydown', onKeyDown, true);
+    });
+  });
+
+  // Clear buttons
+  document.querySelectorAll('.hk-clear').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const key = btn.dataset.key;
+      combos[key] = '';
+      const rec = document.querySelector('.hk-record[data-key="' + key + '"]');
+      if (rec) rec.textContent = '—';
+      checkConflicts();
+    });
+  });
+
+  // Enabled checkboxes
+  document.querySelectorAll('.hk-enabled').forEach(cb => {
+    cb.addEventListener('change', checkConflicts);
+  });
+
+  // Save
+  document.getElementById('save-btn').addEventListener('click', async () => {
+    // Block save if conflicts exist
+    const hasConflict = [...document.querySelectorAll('.hk-conflict')].some(s => s.textContent !== '');
+    if (hasConflict) {
+      document.getElementById('status').textContent = 'Исправьте конфликты перед сохранением';
+      return;
+    }
+    const status = document.getElementById('status');
+    const hotkeys = {};
+    document.querySelectorAll('.hk-enabled').forEach(cb => {
+      const key = cb.dataset.key;
+      hotkeys[key] = { enabled: cb.checked, combo: combos[key] || '' };
+    });
+    const body = JSON.stringify({
+      version: 1,
+      whisper_enabled: document.getElementById('whisper-enabled').checked,
+      hotkeys,
+      autostart_enabled: document.getElementById('autostart-enabled').checked,
+    });
+    status.textContent = 'Saving…';
+    try {
+      const res = await fetch('/settings/save', {
+        method: 'POST', headers: {'Content-Type': 'application/json'}, body,
+      });
+      if (!res.ok) throw new Error(await res.text());
+      status.textContent = 'Saved';
+      setTimeout(() => status.textContent = '', 2000);
+    } catch (err) {
+      status.textContent = 'Error: ' + err.message;
+    }
+  });
+
+  checkConflicts();
+})();
 </script>`)
 
 	return b.String()

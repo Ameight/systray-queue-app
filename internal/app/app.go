@@ -3,8 +3,10 @@ package app
 import (
 	"fmt"
 	"log"
+	"os/exec"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/getlantern/systray"
@@ -30,6 +32,118 @@ var (
 	hkRegs []hotkeys.Registered
 )
 
+// ── Timer state ───────────────────────────────────────────────────────────────
+
+var (
+	timerMu     sync.Mutex
+	timerActive bool
+	timerPaused bool
+	timerEnd    time.Time
+	timerSaved  time.Duration // remaining duration saved on pause
+)
+
+const timerDuration = 25 * time.Minute
+
+func timerToggle() {
+	timerMu.Lock()
+	defer timerMu.Unlock()
+	if !timerActive {
+		timerActive = true
+		timerPaused = false
+		timerEnd = time.Now().Add(timerDuration)
+		return
+	}
+	if timerPaused {
+		timerEnd = time.Now().Add(timerSaved)
+		timerPaused = false
+		return
+	}
+	timerSaved = time.Until(timerEnd)
+	if timerSaved < 0 {
+		timerSaved = 0
+	}
+	timerPaused = true
+}
+
+func timerStop() {
+	timerMu.Lock()
+	defer timerMu.Unlock()
+	timerActive = false
+	timerPaused = false
+}
+
+// timerSnapshot returns a consistent snapshot of timer state under a single lock.
+func timerSnapshot() (active, paused bool, remain time.Duration) {
+	timerMu.Lock()
+	defer timerMu.Unlock()
+	active = timerActive
+	paused = timerPaused
+	if active {
+		if paused {
+			remain = timerSaved
+		} else {
+			remain = time.Until(timerEnd)
+			if remain < 0 {
+				remain = 0
+			}
+		}
+	}
+	return
+}
+
+// ── Formatting ────────────────────────────────────────────────────────────────
+
+func fmtCountdown(d time.Duration) string {
+	if d < 0 {
+		d = 0
+	}
+	d = d.Round(time.Second)
+	m := int(d.Minutes())
+	s := int(d.Seconds()) % 60
+	return fmt.Sprintf("%02d:%02d", m, s)
+}
+
+func fmtElapsed(d time.Duration) string {
+	d = d.Round(time.Minute)
+	if d < time.Minute {
+		return "< 1m"
+	}
+	if d < time.Hour {
+		return fmt.Sprintf("%dm", int(d.Minutes()))
+	}
+	h := int(d.Hours())
+	m := int(d.Minutes()) % 60
+	if m == 0 {
+		return fmt.Sprintf("%dh", h)
+	}
+	return fmt.Sprintf("%dh %dm", h, m)
+}
+
+func taskPreview(text string) string {
+	line := text
+	if idx := strings.IndexByte(line, '\n'); idx >= 0 {
+		line = line[:idx]
+	}
+	line = strings.TrimSpace(line)
+	runes := []rune(line)
+	if len(runes) > 45 {
+		return string(runes[:45]) + "…"
+	}
+	return line
+}
+
+// ── OS notification ───────────────────────────────────────────────────────────
+
+func sendNotification(title, body string) {
+	switch runtime.GOOS {
+	case "darwin":
+		script := fmt.Sprintf(`display notification %q with title %q sound name "Glass"`, body, title)
+		_ = exec.Command("osascript", "-e", script).Run()
+	}
+}
+
+// ── App ───────────────────────────────────────────────────────────────────────
+
 func onReady() {
 	dataDir, err := util.AppDataDir()
 	if err != nil {
@@ -51,46 +165,90 @@ func onReady() {
 	systray.SetTitle("Queue")
 	systray.SetTooltip("Queue")
 
+	// ── Menu layout ───────────────────────────────────────────────────────
+	//  [current task title]          ← top section
+	//  [Start timer / ⏸ Pause ...]
+	//  [Skip]
+	//  [Done]
+	//  ────────────────
+	//  Add task…
+	//  Add task (advanced)…
+	//  View current task…
+	//  Manage order…
+	//  ────────────────
+	//  Settings…
+	//  Quit
+
+	mTaskTitle := systray.AddMenuItem("No tasks", "Click to view current task")
+	systray.AddSeparator()
+	mTimer := systray.AddMenuItem("Start timer", "Start a 25-minute focus timer")
+	mSkip := systray.AddMenuItem("Skip", "Move current task to the end")
+	mDone := systray.AddMenuItem("Done", "Complete current task")
+	systray.AddSeparator()
 	mAddQuick := systray.AddMenuItem("Add task…", "Quick add")
 	mAddAdvanced := systray.AddMenuItem("Add task (advanced)…", "Open advanced editor in browser")
 	mView := systray.AddMenuItem("View current task…", "Open current task in browser")
 	mManage := systray.AddMenuItem("Manage order…", "Reorder tasks")
 	systray.AddSeparator()
-	mSkip := systray.AddMenuItem("Skip", "Move current task to the end")
-	mDone := systray.AddMenuItem("Done", "Complete current task")
-	systray.AddSeparator()
 	mSettings := systray.AddMenuItem("Settings…", "Configure hotkeys")
 	mQuit := systray.AddMenuItem("Quit", "Quit")
 
-	fmtElapsed := func(d time.Duration) string {
-		d = d.Round(time.Minute)
-		if d < time.Minute {
-			return "< 1m"
-		}
-		if d < time.Hour {
-			return fmt.Sprintf("%dm", int(d.Minutes()))
-		}
-		h := int(d.Hours())
-		m := int(d.Minutes()) % 60
-		if m == 0 {
-			return fmt.Sprintf("%dh", h)
-		}
-		return fmt.Sprintf("%dh %dm", h, m)
-	}
+	// ── Refresh ───────────────────────────────────────────────────────────
 
-	updateTooltip := func() {
+	refreshAll := func() {
 		count := len(q.GetAll())
 		task, hasTask := q.Peek()
+		active, paused, remain := timerSnapshot()
+
+		// Task title item
+		if hasTask {
+			mTaskTitle.SetTitle(taskPreview(task.Text))
+			mTaskTitle.Enable()
+			mSkip.Enable()
+			mDone.Enable()
+			mTimer.Enable()
+		} else {
+			mTaskTitle.SetTitle("No tasks")
+			mTaskTitle.Disable()
+			mSkip.Disable()
+			mDone.Disable()
+			mTimer.Disable()
+		}
+
+		// Timer item label
+		switch {
+		case active && paused:
+			mTimer.SetTitle("▶ Resume  " + fmtCountdown(remain))
+		case active:
+			mTimer.SetTitle("⏸ Pause  " + fmtCountdown(remain))
+		default:
+			mTimer.SetTitle("Start timer")
+		}
+
+		// Menubar title & tooltip
+		var titleStr string
+		if active {
+			titleStr = fmtCountdown(remain)
+		}
 		if hasTask && !task.StartedAt.IsZero() {
 			elapsed := fmtElapsed(time.Since(task.StartedAt))
-			systray.SetTitle(elapsed)
+			if active {
+				titleStr += "  " + elapsed
+			} else {
+				titleStr = elapsed
+			}
 			systray.SetTooltip(fmt.Sprintf("Tasks: %d · %s on current task", count, elapsed))
 		} else {
-			systray.SetTitle("Queue")
+			if !active {
+				titleStr = "Queue"
+			}
 			systray.SetTooltip(fmt.Sprintf("Tasks: %d", count))
 		}
+		systray.SetTitle(titleStr)
 	}
-	updateTooltip()
+	refreshAll()
+
+	// ── Quick add ─────────────────────────────────────────────────────────
 
 	quickAdd := func() {
 		text, ok, err := ui.QuickAddText()
@@ -110,24 +268,24 @@ func onReady() {
 			ui.Error("Add task", err.Error())
 			return
 		}
-		updateTooltip()
+		refreshAll()
 	}
+
+	// ── Hotkeys ───────────────────────────────────────────────────────────
 
 	actions := map[string]func(){
 		hotkeys.ActionShowFirst:        func() { _ = openURL("/view") },
 		hotkeys.ActionAddQuick:         quickAdd,
 		hotkeys.ActionManageQueue:      func() { _ = openURL("/") },
 		hotkeys.ActionAddFromClipboard: func() { _ = openURL("/add") },
-		hotkeys.ActionSkip:             func() { _ = q.Skip(); updateTooltip() },
-		hotkeys.ActionComplete:         func() { _, _ = q.Complete(); updateTooltip() },
+		hotkeys.ActionSkip:             func() { _ = q.Skip(); refreshAll() },
+		hotkeys.ActionComplete:         func() { _, _ = q.Complete(); timerStop(); refreshAll() },
 	}
 
-	// menuHotkeys maps hotkey action → menu item tooltip base text.
-	// Used to show the hotkey combo in the tray menu on hover.
 	type menuItem struct {
-		item    *systray.MenuItem
-		base    string
-		action  string
+		item   *systray.MenuItem
+		base   string
+		action string
 	}
 	hotkeyMenuItems := []menuItem{
 		{mView, "Open current task in browser", hotkeys.ActionShowFirst},
@@ -174,23 +332,50 @@ func onReady() {
 		return nil
 	})
 
+	// ── Ticker ────────────────────────────────────────────────────────────
+
 	stopTicker := make(chan struct{})
 	go func() {
-		ticker := time.NewTicker(30 * time.Second)
+		ticker := time.NewTicker(time.Second)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ticker.C:
-				updateTooltip()
+				// Check timer expiry
+				var expired bool
+				timerMu.Lock()
+				if timerActive && !timerPaused && time.Now().After(timerEnd) {
+					timerActive = false
+					expired = true
+				}
+				timerMu.Unlock()
+				if expired {
+					sendNotification("Queue Timer", "Время вышло! Сделай перерыв.")
+				}
+				refreshAll()
 			case <-stopTicker:
 				return
 			}
 		}
 	}()
 
+	// ── Menu event loop ───────────────────────────────────────────────────
+
 	go func() {
 		for {
 			select {
+			case <-mTaskTitle.ClickedCh:
+				_ = openURL("/view")
+			case <-mTimer.ClickedCh:
+				timerToggle()
+				refreshAll()
+			case <-mSkip.ClickedCh:
+				_ = q.Skip()
+				refreshAll()
+			case <-mDone.ClickedCh:
+				_, _ = q.Complete()
+				timerStop()
+				refreshAll()
 			case <-mAddQuick.ClickedCh:
 				quickAdd()
 			case <-mAddAdvanced.ClickedCh:
@@ -199,12 +384,6 @@ func onReady() {
 				_ = openURL("/view")
 			case <-mManage.ClickedCh:
 				_ = openURL("/")
-			case <-mSkip.ClickedCh:
-				_ = q.Skip()
-				updateTooltip()
-			case <-mDone.ClickedCh:
-				_, _ = q.Complete()
-				updateTooltip()
 			case <-mSettings.ClickedCh:
 				_ = openURL("/settings")
 			case <-mQuit.ClickedCh:
