@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"golang.design/x/hotkey"
 	"gopkg.in/yaml.v3"
@@ -29,9 +30,17 @@ type HotkeyConfig struct {
 	Combo   string `yaml:"combo"   json:"combo"`
 }
 
+// TrayGroupConfig controls visibility and order of a tray menu section.
+type TrayGroupConfig struct {
+	ID      string `yaml:"id"      json:"id"`
+	Visible bool   `yaml:"visible" json:"visible"`
+}
+
 type KeyConfig struct {
 	Version        int                     `yaml:"version"                    json:"version"`
 	WhisperEnabled *bool                   `yaml:"whisper_enabled,omitempty"  json:"whisper_enabled"`
+	TimerMinutes   int                     `yaml:"timer_minutes,omitempty"    json:"timer_minutes,omitempty"`
+	TrayGroups     []TrayGroupConfig       `yaml:"tray_groups,omitempty"      json:"tray_groups,omitempty"`
 	Hotkeys        map[string]HotkeyConfig `yaml:"hotkeys"                    json:"hotkeys"`
 }
 
@@ -39,6 +48,40 @@ type KeyConfig struct {
 // Defaults to true when the field has never been set.
 func (cfg KeyConfig) IsWhisperEnabled() bool {
 	return cfg.WhisperEnabled == nil || *cfg.WhisperEnabled
+}
+
+// DefaultTrayGroupOrder is the canonical group order used when config is absent.
+var DefaultTrayGroupOrder = []string{"task", "timer", "actions", "navigation", "system"}
+
+// EffectiveTrayGroups returns the configured groups, filling in any missing ones
+// at the end in default order so new groups added in future are always present.
+func (cfg KeyConfig) EffectiveTrayGroups() []TrayGroupConfig {
+	if len(cfg.TrayGroups) == 0 {
+		groups := make([]TrayGroupConfig, len(DefaultTrayGroupOrder))
+		for i, id := range DefaultTrayGroupOrder {
+			groups[i] = TrayGroupConfig{ID: id, Visible: true}
+		}
+		return groups
+	}
+	seen := make(map[string]bool, len(cfg.TrayGroups))
+	for _, g := range cfg.TrayGroups {
+		seen[g.ID] = true
+	}
+	result := append([]TrayGroupConfig(nil), cfg.TrayGroups...)
+	for _, id := range DefaultTrayGroupOrder {
+		if !seen[id] {
+			result = append(result, TrayGroupConfig{ID: id, Visible: true})
+		}
+	}
+	return result
+}
+
+// TimerDuration returns the configured timer duration (default 25 min).
+func (cfg KeyConfig) TimerDuration() time.Duration {
+	if cfg.TimerMinutes <= 0 {
+		return 25 * time.Minute
+	}
+	return time.Duration(cfg.TimerMinutes) * time.Minute
 }
 
 type Registered struct {

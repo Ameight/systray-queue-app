@@ -1074,6 +1074,73 @@ func renderSettingsHTML(cfg hotkeys.KeyConfig) string {
 
 	b.WriteString(`</tbody></table>`)
 
+	// ── Tray section ──────────────────────────────────────────────────────
+
+	timerMin := cfg.TimerMinutes
+	if timerMin <= 0 {
+		timerMin = 25
+	}
+
+	trayGroupLabels := map[string]string{
+		"task":       "Текущая задача (заголовок задачи)",
+		"timer":      "Таймер (Start/Pause)",
+		"actions":    "Действия (Skip / Done)",
+		"navigation": "Навигация (Add / View / Manage)",
+		"system":     "Система (Settings / Quit)",
+	}
+
+	b.WriteString(`<h2 style="font-size:16px;margin:28px 0 10px">Трей</h2>`)
+	b.WriteString(fmt.Sprintf(`<div style="margin-bottom:16px">
+  <label style="display:flex;align-items:center;gap:8px">
+    Длительность таймера:
+    <input type="number" id="timer-minutes" min="1" max="180" value="%d"
+      style="width:64px;padding:5px 8px;border:1px solid #ccc;border-radius:6px;font-size:14px">
+    мин
+  </label>
+</div>`, timerMin))
+
+	b.WriteString(`<p class="muted" style="margin-bottom:8px">Порядок групп — изменения вступают в силу после перезапуска.</p>`)
+	b.WriteString(`<style>
+.tg-row{display:flex;align-items:center;gap:8px;padding:7px 10px;background:#fff;border:1px solid #e8e8e8;border-radius:8px;margin-bottom:4px;font-size:14px}
+.tg-label{flex:1}
+.tg-btn{background:none;border:1px solid #ddd;border-radius:5px;cursor:pointer;width:26px;height:26px;font-size:13px;display:flex;align-items:center;justify-content:center;padding:0}
+.tg-btn:hover{background:#f0f0f0}
+.tg-btn:disabled{opacity:.3;cursor:default}
+</style>`)
+	b.WriteString(`<div id="tray-group-list">`)
+	for _, g := range cfg.EffectiveTrayGroups() {
+		checked := ""
+		if g.Visible {
+			checked = " checked"
+		}
+		label := trayGroupLabels[g.ID]
+		if label == "" {
+			label = g.ID
+		}
+		b.WriteString(fmt.Sprintf(`<div class="tg-row" data-id="%s">
+  <input type="checkbox" class="tg-vis"%s style="width:15px;height:15px;cursor:pointer">
+  <span class="tg-label">%s</span>
+  <button class="tg-btn tg-up" title="Вверх">↑</button>
+  <button class="tg-btn tg-dn" title="Вниз">↓</button>
+</div>`, esc(g.ID), checked, esc(label)))
+	}
+	b.WriteString(`</div>`)
+	b.WriteString(`<script>
+(function(){
+  const list = document.getElementById('tray-group-list');
+  list.addEventListener('click', e => {
+    const btn = e.target.closest('.tg-btn');
+    if (!btn) return;
+    const row = btn.closest('.tg-row');
+    if (btn.classList.contains('tg-up') && row.previousElementSibling) {
+      list.insertBefore(row, row.previousElementSibling);
+    } else if (btn.classList.contains('tg-dn') && row.nextElementSibling) {
+      list.insertBefore(row.nextElementSibling, row);
+    }
+  });
+})();
+</script>`)
+
 	// Whisper section
 	whisperChecked := ""
 	if cfg.IsWhisperEnabled() {
@@ -1101,6 +1168,18 @@ func renderSettingsHTML(cfg hotkeys.KeyConfig) string {
 	b.WriteString(`<button onclick="location.href='/'">Back</button>`)
 	b.WriteString(`<span id="status" class="muted"></span>`)
 	b.WriteString(`</div>`)
+
+	b.WriteString(`<script>
+(function() {
+  // ── Tray groups collector (used by save) ─────────────────────────────
+  window._collectTrayGroups = function() {
+    return [...document.querySelectorAll('#tray-group-list .tg-row')].map(row => ({
+      id: row.dataset.id,
+      visible: row.querySelector('.tg-vis').checked,
+    }));
+  };
+})();
+</script>`)
 
 	b.WriteString(`<script>
 (function() {
@@ -1217,8 +1296,13 @@ func renderSettingsHTML(cfg hotkeys.KeyConfig) string {
       const key = cb.dataset.key;
       hotkeys[key] = { enabled: cb.checked, combo: combos[key] || '' };
     });
+    const timerMinEl = document.getElementById('timer-minutes');
+    const timerMinutes = timerMinEl ? parseInt(timerMinEl.value, 10) || 25 : 25;
+    const trayGroups = window._collectTrayGroups ? window._collectTrayGroups() : [];
     const body = JSON.stringify({
       version: 1,
+      timer_minutes: timerMinutes,
+      tray_groups: trayGroups,
       whisper_enabled: document.getElementById('whisper-enabled').checked,
       hotkeys,
       autostart_enabled: document.getElementById('autostart-enabled').checked,

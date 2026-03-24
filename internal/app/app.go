@@ -35,14 +35,13 @@ var (
 // ── Timer state ───────────────────────────────────────────────────────────────
 
 var (
-	timerMu     sync.Mutex
-	timerActive bool
-	timerPaused bool
-	timerEnd    time.Time
-	timerSaved  time.Duration // remaining duration saved on pause
+	timerMu       sync.Mutex
+	timerActive   bool
+	timerPaused   bool
+	timerEnd      time.Time
+	timerSaved    time.Duration
+	timerDuration = 25 * time.Minute
 )
-
-const timerDuration = 25 * time.Minute
 
 func timerToggle() {
 	timerMu.Lock()
@@ -72,7 +71,6 @@ func timerStop() {
 	timerPaused = false
 }
 
-// timerSnapshot returns a consistent snapshot of timer state under a single lock.
 func timerSnapshot() (active, paused bool, remain time.Duration) {
 	timerMu.Lock()
 	defer timerMu.Unlock()
@@ -165,35 +163,89 @@ func onReady() {
 	systray.SetTitle("Queue")
 	systray.SetTooltip("Queue")
 
-	// ── Menu layout ───────────────────────────────────────────────────────
-	//  [current task title]          ← top section
-	//  [Start timer / ⏸ Pause ...]
-	//  [Skip]
-	//  [Done]
-	//  ────────────────
-	//  Add task…
-	//  Add task (advanced)…
-	//  View current task…
-	//  Manage order…
-	//  ────────────────
-	//  Settings…
-	//  Quit
+	// ── Load config early (needed for menu order + timer duration) ────────
+	cfg, cfgPath, cfgErr := hotkeys.LoadOrCreate(dataDir)
+	timerDuration = cfg.TimerDuration()
 
-	mTaskTitle := systray.AddMenuItem("No tasks", "Click to view current task")
-	systray.AddSeparator()
-	mTimer := systray.AddMenuItem("Start timer", "Start a 25-minute focus timer")
-	mSkip := systray.AddMenuItem("Skip", "Move current task to the end")
-	mDone := systray.AddMenuItem("Done", "Complete current task")
-	systray.AddSeparator()
-	mAddQuick := systray.AddMenuItem("Add task…", "Quick add")
-	mAddAdvanced := systray.AddMenuItem("Add task (advanced)…", "Open advanced editor in browser")
-	mView := systray.AddMenuItem("View current task…", "Open current task in browser")
-	mManage := systray.AddMenuItem("Manage order…", "Reorder tasks")
-	systray.AddSeparator()
-	mSettings := systray.AddMenuItem("Settings…", "Configure hotkeys")
-	mQuit := systray.AddMenuItem("Quit", "Quit")
+	// ── Build menu in configured group order ──────────────────────────────
+	//
+	// Groups: "task" | "timer" | "actions" | "navigation" | "system"
+	//
+	// Items are created in the order specified by cfg.EffectiveTrayGroups(),
+	// with separators between groups. Visibility is applied immediately.
 
-	// ── Refresh ───────────────────────────────────────────────────────────
+	var (
+		mTaskTitle   *systray.MenuItem
+		mTimer       *systray.MenuItem
+		mSkip        *systray.MenuItem
+		mDone        *systray.MenuItem
+		mAddQuick    *systray.MenuItem
+		mAddAdvanced *systray.MenuItem
+		mView        *systray.MenuItem
+		mManage      *systray.MenuItem
+		mSettings    *systray.MenuItem
+		mQuit        *systray.MenuItem
+	)
+
+	// groupItems maps group ID → items in that group (for live visibility toggle).
+	groupItems := map[string][]*systray.MenuItem{}
+
+	groups := cfg.EffectiveTrayGroups()
+	for i, g := range groups {
+		if i > 0 {
+			systray.AddSeparator()
+		}
+		var items []*systray.MenuItem
+		switch g.ID {
+		case "task":
+			mTaskTitle = systray.AddMenuItem("No tasks", "Click to view current task")
+			items = []*systray.MenuItem{mTaskTitle}
+		case "timer":
+			mTimer = systray.AddMenuItem("Start timer", "Start a focus timer")
+			items = []*systray.MenuItem{mTimer}
+		case "actions":
+			mSkip = systray.AddMenuItem("Skip", "Move current task to the end")
+			mDone = systray.AddMenuItem("Done", "Complete current task")
+			items = []*systray.MenuItem{mSkip, mDone}
+		case "navigation":
+			mAddQuick = systray.AddMenuItem("Add task…", "Quick add")
+			mAddAdvanced = systray.AddMenuItem("Add task (advanced)…", "Open advanced editor in browser")
+			mView = systray.AddMenuItem("View current task…", "Open current task in browser")
+			mManage = systray.AddMenuItem("Manage order…", "Reorder tasks")
+			items = []*systray.MenuItem{mAddQuick, mAddAdvanced, mView, mManage}
+		case "system":
+			mSettings = systray.AddMenuItem("Settings…", "Configure hotkeys")
+			mQuit = systray.AddMenuItem("Quit", "Quit")
+			items = []*systray.MenuItem{mSettings, mQuit}
+		}
+		groupItems[g.ID] = items
+		if !g.Visible {
+			for _, item := range items {
+				if item != nil {
+					item.Hide()
+				}
+			}
+		}
+	}
+
+	// applyVisibility applies show/hide for all groups from a fresh config.
+	applyVisibility := func(newGroups []hotkeys.TrayGroupConfig) {
+		for _, g := range newGroups {
+			items := groupItems[g.ID]
+			for _, item := range items {
+				if item == nil {
+					continue
+				}
+				if g.Visible {
+					item.Show()
+				} else {
+					item.Hide()
+				}
+			}
+		}
+	}
+
+	// ── refreshAll updates all dynamic tray content ───────────────────────
 
 	refreshAll := func() {
 		count := len(q.GetAll())
@@ -201,28 +253,45 @@ func onReady() {
 		active, paused, remain := timerSnapshot()
 
 		// Task title item
-		if hasTask {
-			mTaskTitle.SetTitle(taskPreview(task.Text))
-			mTaskTitle.Enable()
-			mSkip.Enable()
-			mDone.Enable()
-			mTimer.Enable()
-		} else {
-			mTaskTitle.SetTitle("No tasks")
-			mTaskTitle.Disable()
-			mSkip.Disable()
-			mDone.Disable()
-			mTimer.Disable()
+		if mTaskTitle != nil {
+			if hasTask {
+				mTaskTitle.SetTitle(taskPreview(task.Text))
+				mTaskTitle.Enable()
+			} else {
+				mTaskTitle.SetTitle("No tasks")
+				mTaskTitle.Disable()
+			}
+		}
+		if mSkip != nil {
+			if hasTask {
+				mSkip.Enable()
+			} else {
+				mSkip.Disable()
+			}
+		}
+		if mDone != nil {
+			if hasTask {
+				mDone.Enable()
+			} else {
+				mDone.Disable()
+			}
 		}
 
 		// Timer item label
-		switch {
-		case active && paused:
-			mTimer.SetTitle("▶ Resume  " + fmtCountdown(remain))
-		case active:
-			mTimer.SetTitle("⏸ Pause  " + fmtCountdown(remain))
-		default:
-			mTimer.SetTitle("Start timer")
+		if mTimer != nil {
+			if hasTask {
+				mTimer.Enable()
+			} else {
+				mTimer.Disable()
+			}
+			switch {
+			case active && paused:
+				mTimer.SetTitle("▶ Resume  " + fmtCountdown(remain))
+			case active:
+				mTimer.SetTitle("⏸ Pause  " + fmtCountdown(remain))
+			default:
+				mTimer.SetTitle("Start timer")
+			}
 		}
 
 		// Menubar title & tooltip
@@ -287,28 +356,38 @@ func onReady() {
 		base   string
 		action string
 	}
-	hotkeyMenuItems := []menuItem{
-		{mView, "Open current task in browser", hotkeys.ActionShowFirst},
-		{mAddQuick, "Quick add", hotkeys.ActionAddQuick},
-		{mAddAdvanced, "Open advanced editor in browser", hotkeys.ActionAddFromClipboard},
-		{mSkip, "Move current task to the end", hotkeys.ActionSkip},
-		{mDone, "Complete current task", hotkeys.ActionComplete},
-		{mManage, "Reorder tasks", hotkeys.ActionManageQueue},
+	hotkeyMenuItems := []menuItem{}
+	if mView != nil {
+		hotkeyMenuItems = append(hotkeyMenuItems, menuItem{mView, "Open current task in browser", hotkeys.ActionShowFirst})
+	}
+	if mAddQuick != nil {
+		hotkeyMenuItems = append(hotkeyMenuItems, menuItem{mAddQuick, "Quick add", hotkeys.ActionAddQuick})
+	}
+	if mAddAdvanced != nil {
+		hotkeyMenuItems = append(hotkeyMenuItems, menuItem{mAddAdvanced, "Open advanced editor in browser", hotkeys.ActionAddFromClipboard})
+	}
+	if mSkip != nil {
+		hotkeyMenuItems = append(hotkeyMenuItems, menuItem{mSkip, "Move current task to the end", hotkeys.ActionSkip})
+	}
+	if mDone != nil {
+		hotkeyMenuItems = append(hotkeyMenuItems, menuItem{mDone, "Complete current task", hotkeys.ActionComplete})
+	}
+	if mManage != nil {
+		hotkeyMenuItems = append(hotkeyMenuItems, menuItem{mManage, "Reorder tasks", hotkeys.ActionManageQueue})
 	}
 
-	applyTooltips := func(cfg hotkeys.KeyConfig) {
+	applyTooltips := func(c hotkeys.KeyConfig) {
 		for _, m := range hotkeyMenuItems {
 			tooltip := m.base
-			if hc, ok := cfg.Hotkeys[m.action]; ok && hc.Enabled && hc.Combo != "" {
+			if hc, ok := c.Hotkeys[m.action]; ok && hc.Enabled && hc.Combo != "" {
 				tooltip += "  " + hotkeys.FormatCombo(hc.Combo)
 			}
 			m.item.SetTooltip(tooltip)
 		}
 	}
 
-	cfg, cfgPath, err := hotkeys.LoadOrCreate(dataDir)
-	if err != nil {
-		ui.Error("Hotkeys", err.Error())
+	if cfgErr != nil {
+		ui.Error("Hotkeys", cfgErr.Error())
 	} else {
 		applyTooltips(cfg)
 		hkRegs, err = hotkeys.Register(cfg, actions)
@@ -329,6 +408,10 @@ func onReady() {
 		}
 		hkRegs = newRegs
 		applyTooltips(newCfg)
+		applyVisibility(newCfg.EffectiveTrayGroups())
+		timerMu.Lock()
+		timerDuration = newCfg.TimerDuration()
+		timerMu.Unlock()
 		return nil
 	})
 
@@ -341,7 +424,6 @@ func onReady() {
 		for {
 			select {
 			case <-ticker.C:
-				// Check timer expiry
 				var expired bool
 				timerMu.Lock()
 				if timerActive && !timerPaused && time.Now().After(timerEnd) {
@@ -362,31 +444,72 @@ func onReady() {
 	// ── Menu event loop ───────────────────────────────────────────────────
 
 	go func() {
+		// Build channel cases dynamically so nil items are skipped.
+		for {
+			var cases []struct {
+				ch   <-chan struct{}
+				fn   func()
+			}
+			add := func(item *systray.MenuItem, fn func()) {
+				if item != nil {
+					cases = append(cases, struct {
+						ch <-chan struct{}
+						fn func()
+					}{item.ClickedCh, fn})
+				}
+			}
+
+			add(mTaskTitle, func() { _ = openURL("/view") })
+			add(mTimer, func() { timerToggle(); refreshAll() })
+			add(mSkip, func() { _ = q.Skip(); refreshAll() })
+			add(mDone, func() { _, _ = q.Complete(); timerStop(); refreshAll() })
+			add(mAddQuick, quickAdd)
+			add(mAddAdvanced, func() { _ = openURL("/add") })
+			add(mView, func() { _ = openURL("/view") })
+			add(mManage, func() { _ = openURL("/") })
+			add(mSettings, func() { _ = openURL("/settings") })
+
+			// select requires static cases — fall back to individual goroutines
+			// for variable items, use a fixed select on known channels.
+			break
+		}
+
+		// Fixed select — items may be nil but their ClickedCh will never fire
+		// if the item was never created (nil pointer guard applied above).
+		nilCh := make(chan struct{}) // never fires
+
+		ch := func(item *systray.MenuItem) <-chan struct{} {
+			if item == nil {
+				return nilCh
+			}
+			return item.ClickedCh
+		}
+
 		for {
 			select {
-			case <-mTaskTitle.ClickedCh:
+			case <-ch(mTaskTitle):
 				_ = openURL("/view")
-			case <-mTimer.ClickedCh:
+			case <-ch(mTimer):
 				timerToggle()
 				refreshAll()
-			case <-mSkip.ClickedCh:
+			case <-ch(mSkip):
 				_ = q.Skip()
 				refreshAll()
-			case <-mDone.ClickedCh:
+			case <-ch(mDone):
 				_, _ = q.Complete()
 				timerStop()
 				refreshAll()
-			case <-mAddQuick.ClickedCh:
+			case <-ch(mAddQuick):
 				quickAdd()
-			case <-mAddAdvanced.ClickedCh:
+			case <-ch(mAddAdvanced):
 				_ = openURL("/add")
-			case <-mView.ClickedCh:
+			case <-ch(mView):
 				_ = openURL("/view")
-			case <-mManage.ClickedCh:
+			case <-ch(mManage):
 				_ = openURL("/")
-			case <-mSettings.ClickedCh:
+			case <-ch(mSettings):
 				_ = openURL("/settings")
-			case <-mQuit.ClickedCh:
+			case <-ch(mQuit):
 				close(stopTicker)
 				systray.Quit()
 				return
