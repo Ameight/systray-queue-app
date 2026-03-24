@@ -62,9 +62,33 @@ func onReady() {
 	mSettings := systray.AddMenuItem("Settings…", "Configure hotkeys")
 	mQuit := systray.AddMenuItem("Quit", "Quit")
 
+	fmtElapsed := func(d time.Duration) string {
+		d = d.Round(time.Minute)
+		if d < time.Minute {
+			return "< 1m"
+		}
+		if d < time.Hour {
+			return fmt.Sprintf("%dm", int(d.Minutes()))
+		}
+		h := int(d.Hours())
+		m := int(d.Minutes()) % 60
+		if m == 0 {
+			return fmt.Sprintf("%dh", h)
+		}
+		return fmt.Sprintf("%dh %dm", h, m)
+	}
+
 	updateTooltip := func() {
 		count := len(q.GetAll())
-		systray.SetTooltip(fmt.Sprintf("Tasks: %d", count))
+		task, hasTask := q.Peek()
+		if hasTask && !task.StartedAt.IsZero() {
+			elapsed := fmtElapsed(time.Since(task.StartedAt))
+			systray.SetTitle(elapsed)
+			systray.SetTooltip(fmt.Sprintf("Tasks: %d · %s on current task", count, elapsed))
+		} else {
+			systray.SetTitle("Queue")
+			systray.SetTooltip(fmt.Sprintf("Tasks: %d", count))
+		}
 	}
 	updateTooltip()
 
@@ -150,6 +174,20 @@ func onReady() {
 		return nil
 	})
 
+	stopTicker := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				updateTooltip()
+			case <-stopTicker:
+				return
+			}
+		}
+	}()
+
 	go func() {
 		for {
 			select {
@@ -170,6 +208,7 @@ func onReady() {
 			case <-mSettings.ClickedCh:
 				_ = openURL("/settings")
 			case <-mQuit.ClickedCh:
+				close(stopTicker)
 				systray.Quit()
 				return
 			}
