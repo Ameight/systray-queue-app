@@ -300,13 +300,21 @@ func onReady() {
 			titleStr = fmtCountdown(remain)
 		}
 		if hasTask && !task.StartedAt.IsZero() {
-			elapsed := fmtElapsed(time.Since(task.StartedAt))
-			if active {
-				titleStr += "  " + elapsed
+			elapsedDur := time.Since(task.StartedAt)
+			if elapsedDur >= time.Minute {
+				elapsed := fmtElapsed(elapsedDur)
+				if active {
+					titleStr += "  " + elapsed
+				} else {
+					titleStr = elapsed
+				}
+				systray.SetTooltip(fmt.Sprintf("Tasks: %d · %s on current task", count, elapsed))
 			} else {
-				titleStr = elapsed
+				if !active {
+					titleStr = "Queue"
+				}
+				systray.SetTooltip(fmt.Sprintf("Tasks: %d", count))
 			}
-			systray.SetTooltip(fmt.Sprintf("Tasks: %d · %s on current task", count, elapsed))
 		} else {
 			if !active {
 				titleStr = "Queue"

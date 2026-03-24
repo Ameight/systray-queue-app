@@ -159,6 +159,10 @@ func (q *TaskQueue) loadLocked() error {
 		return err
 	}
 	q.Tasks = tmp.Tasks
+	// First task in queue is already active — set StartedAt if missing.
+	if len(q.Tasks) > 0 && q.Tasks[0].StartedAt.IsZero() {
+		q.Tasks[0].StartedAt = time.Now()
+	}
 	return nil
 }
 
@@ -206,6 +210,10 @@ func (q *TaskQueue) Skip() error {
 	}
 	first := q.Tasks[0]
 	q.Tasks = append(q.Tasks[1:], first)
+	// New first task — mark when it became active.
+	if q.Tasks[0].StartedAt.IsZero() {
+		q.Tasks[0].StartedAt = time.Now()
+	}
 	return q.saveLocked()
 }
 

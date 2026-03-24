@@ -1390,8 +1390,13 @@ func renderHistoryHTML(entries []queue.Task) string {
 		}
 		return fmt.Sprintf("%dh %dm", h, m)
 	}
+	now := time.Now()
 	fmtTime := func(t time.Time) string {
-		return t.Local().Format("15:04")
+		tl := t.Local()
+		if tl.Year() == now.Year() && tl.YearDay() == now.YearDay() {
+			return tl.Format("15:04")
+		}
+		return tl.Format("02 Jan, 15:04")
 	}
 	fmtDate := func(t time.Time) string {
 		return t.Local().Format("02 Jan 2006")
@@ -1404,7 +1409,6 @@ func renderHistoryHTML(entries []queue.Task) string {
 	}
 	var groups []group
 	dayKey := func(t time.Time) string { return t.Local().Format("2006-01-02") }
-	now := time.Now()
 	today := dayKey(now)
 	yesterday := dayKey(now.AddDate(0, 0, -1))
 	weekAgo := now.AddDate(0, 0, -6)
