@@ -3,23 +3,25 @@
 <plist version="1.0">
 <dict>
 	<key>CFBundleName</key>
-	<string>SystrayQueue</string>
+	<string>Queue</string>
 	<key>CFBundleDisplayName</key>
-	<string>SystrayQueue</string>
+	<string>Queue</string>
 	<key>CFBundleIdentifier</key>
-	<string>com.example.systray-queue</string>
+	<string>__BUNDLE_ID__</string>
 	<key>CFBundleVersion</key>
-	<string>1.0</string>
+	<string>__VERSION__</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.0</string>
+	<string>__VERSION__</string>
 	<key>CFBundleExecutable</key>
 	<string>systray-queue-app</string>
 	<key>LSMinimumSystemVersion</key>
-	<string>10.13</string>
-	<!-- Скрыть иконку из Dock -->
+	<string>12.0</string>
+	<!-- Hide from Dock — menu bar only app -->
 	<key>LSUIElement</key>
 	<true/>
 	<key>NSHighResolutionCapable</key>
 	<true/>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Queue uses the microphone to record voice notes.</string>
 </dict>
 </plist>

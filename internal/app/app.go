@@ -15,6 +15,7 @@ import (
 	"github.com/Ameight/systray-queue-app/internal/manage"
 	"github.com/Ameight/systray-queue-app/internal/queue"
 	"github.com/Ameight/systray-queue-app/internal/ui"
+	"github.com/Ameight/systray-queue-app/internal/updater"
 	"github.com/Ameight/systray-queue-app/internal/util"
 )
 
@@ -422,6 +423,24 @@ func onReady() {
 		timerMu.Unlock()
 		return nil
 	})
+
+	// ── Background update check ───────────────────────────────────────────
+
+	go func() {
+		time.Sleep(15 * time.Second) // don't check immediately on startup
+		doCheck := func() {
+			info, err := updater.Check()
+			mgr.SetUpdateInfo(info, err)
+			if info != nil {
+				sendNotification("Queue — Update available", fmt.Sprintf(
+					"Version %s is available. Open Settings to install.", info.Version))
+			}
+		}
+		doCheck()
+		for range time.Tick(24 * time.Hour) {
+			doCheck()
+		}
+	}()
 
 	// ── Ticker ────────────────────────────────────────────────────────────
 

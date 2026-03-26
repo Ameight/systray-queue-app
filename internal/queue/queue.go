@@ -278,6 +278,68 @@ func (q *TaskQueue) UpdateText(id, text string) error {
 	return fmt.Errorf("task not found: %s", id)
 }
 
+func (q *TaskQueue) UpdateTask(id, text, attachmentPath string, attachmentType AttachmentType) error {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	for i := range q.Tasks {
+		if q.Tasks[i].ID == id {
+			q.Tasks[i].Text = text
+			if attachmentPath != "" {
+				q.Tasks[i].AttachmentPath = attachmentPath
+				q.Tasks[i].AttachmentType = attachmentType
+			}
+			return q.saveLocked()
+		}
+	}
+	return fmt.Errorf("task not found: %s", id)
+}
+
+func (q *TaskQueue) DeleteByID(id string) error {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	for i, t := range q.Tasks {
+		if t.ID == id {
+			q.Tasks = append(q.Tasks[:i], q.Tasks[i+1:]...)
+			if i == 0 && len(q.Tasks) > 0 && q.Tasks[0].StartedAt.IsZero() {
+				q.Tasks[0].StartedAt = time.Now()
+			}
+			return q.saveLocked()
+		}
+	}
+	return fmt.Errorf("task not found: %s", id)
+}
+
+func (q *TaskQueue) CompleteByID(id string) (Task, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	for i, t := range q.Tasks {
+		if t.ID == id {
+			t.CompletedAt = time.Now()
+			if t.StartedAt.IsZero() {
+				t.StartedAt = t.CreatedAt
+			}
+			q.Tasks = append(q.Tasks[:i], q.Tasks[i+1:]...)
+			if i == 0 && len(q.Tasks) > 0 && q.Tasks[0].StartedAt.IsZero() {
+				q.Tasks[0].StartedAt = time.Now()
+			}
+			if err := q.saveLocked(); err != nil {
+				return Task{}, err
+			}
+			if q.history != nil {
+				_ = q.history.Add(t)
+			}
+			if t.AttachmentPath != "" && q.attachmentsDir != "" {
+				inside, err := isPathInsideDir(t.AttachmentPath, q.attachmentsDir)
+				if err == nil && inside {
+					_ = os.Remove(t.AttachmentPath)
+				}
+			}
+			return t, nil
+		}
+	}
+	return Task{}, fmt.Errorf("task not found: %s", id)
+}
+
 func (q *TaskQueue) ReorderByIndices(order []int) error {
 	q.mu.Lock()
 	defer q.mu.Unlock()

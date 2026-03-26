@@ -22,6 +22,7 @@ import (
 	"github.com/Ameight/systray-queue-app/internal/hotkeys"
 	"github.com/Ameight/systray-queue-app/internal/queue"
 	"github.com/Ameight/systray-queue-app/internal/ui"
+	"github.com/Ameight/systray-queue-app/internal/updater"
 	"github.com/Ameight/systray-queue-app/internal/util"
 )
 
@@ -35,10 +36,31 @@ type Server struct {
 	err  error
 
 	reloadHotkeys func() error
+
+	updateMu      sync.Mutex
+	latestUpdate  *updater.UpdateInfo
+	updateErr     error
+	updateChecked time.Time
 }
 
 func New(q *queue.TaskQueue, baseDir string, favicon []byte) *Server {
 	return &Server{q: q, baseDir: baseDir, favicon: favicon}
+}
+
+// SetUpdateInfo stores the result of an update check for use by the settings page.
+func (s *Server) SetUpdateInfo(info *updater.UpdateInfo, err error) {
+	s.updateMu.Lock()
+	defer s.updateMu.Unlock()
+	s.latestUpdate = info
+	s.updateErr = err
+	s.updateChecked = time.Now()
+}
+
+// LatestUpdate returns the last known update info (may be nil).
+func (s *Server) LatestUpdate() *updater.UpdateInfo {
+	s.updateMu.Lock()
+	defer s.updateMu.Unlock()
+	return s.latestUpdate
 }
 
 // SetReloadFn sets a callback that is invoked after hotkey config is saved.
@@ -76,9 +98,13 @@ func (s *Server) start() (string, error) {
 	mux.HandleFunc("/task_preview", s.handleTaskPreview)
 	mux.HandleFunc("/task_raw", s.handleTaskRaw)
 	mux.HandleFunc("/task_update", s.handleTaskUpdate)
+	mux.HandleFunc("/task_action", s.handleTaskAction)
+	mux.HandleFunc("/attachment_upload", s.handleAttachmentUpload)
 	mux.HandleFunc("/history", s.handleHistory)
 	mux.HandleFunc("/history/delete", s.handleHistoryDelete)
 	mux.HandleFunc("/history/clear", s.handleHistoryClear)
+	mux.HandleFunc("/update/check", s.handleUpdateCheck)
+	mux.HandleFunc("/update/install", s.handleUpdateInstall)
 
 	srv := &http.Server{
 		Handler:           mux,
@@ -347,14 +373,22 @@ func (s *Server) handleAttachment(w http.ResponseWriter, r *http.Request) {
 }
 
 func renderAddHTML(whisperEnabled bool) string {
-	hint := `Markdown supported. You can attach an image or audio file.`
+	whisperJS := "false"
 	if whisperEnabled {
-		hint = `Markdown supported. You can attach an image or record a voice note (requires <a href="https://github.com/openai/whisper" target="_blank">whisper</a>).`
+		whisperJS = "true"
 	}
 
-	recSection := ""
-	if whisperEnabled {
-		recSection = `
+	return `<h1>Add task</h1>
+<form id="task-form" action="/add_submit" method="post" enctype="multipart/form-data">
+  <div class="row">
+    <button type="submit">Save</button>
+    <button type="button" onclick="location.href='/view'">Cancel</button>
+  </div>
+  <p class="muted">Markdown supported. Paste image (Ctrl+V / ⌘V) to attach. You can also record a voice note.</p>
+  <p><textarea name="text" id="task-text" placeholder="Write task in Markdown..."></textarea></p>
+  <p><label>Attachment: <input type="file" name="attachment" id="attach-input" accept="image/*,audio/*" /></label>
+     <span id="paste-hint" class="muted" style="margin-left:8px"></span></p>
+  <input type="hidden" name="voice_attachment" id="voice-attachment-name" value="">
   <div style="margin-top:12px">
     <div class="row">
       <button type="button" id="rec-btn">Record voice note</button>
@@ -362,15 +396,33 @@ func renderAddHTML(whisperEnabled bool) string {
     </div>
     <div id="rec-player" style="display:none;margin-top:8px"></div>
   </div>
+</form>
 
 <script>
 (function(){
+  const whisperEnabled = ` + whisperJS + `;
   const btn = document.getElementById('rec-btn');
-  const status = document.getElementById('rec-status');
+  const recStatus = document.getElementById('rec-status');
   const player = document.getElementById('rec-player');
   const voiceField = document.getElementById('voice-attachment-name');
   const textarea = document.getElementById('task-text');
+  const attachInput = document.getElementById('attach-input');
+  const pasteHint = document.getElementById('paste-hint');
 
+  // ── Paste image from clipboard ────────────────────────────────────────
+  textarea.addEventListener('paste', e => {
+    const items = [...(e.clipboardData?.items || [])];
+    const imgItem = items.find(i => i.type.startsWith('image/'));
+    if (!imgItem) return;
+    e.preventDefault();
+    const file = imgItem.getAsFile();
+    const dt = new DataTransfer();
+    dt.items.add(file);
+    attachInput.files = dt.files;
+    pasteHint.textContent = 'Image pasted (' + file.type + ')';
+  });
+
+  // ── Voice recording ───────────────────────────────────────────────────
   let mediaRecorder = null;
   let chunks = [];
 
@@ -384,7 +436,7 @@ func renderAddHTML(whisperEnabled bool) string {
     try {
       stream = await navigator.mediaDevices.getUserMedia({ audio: true });
     } catch (e) {
-      status.textContent = 'Microphone access denied: ' + e.message;
+      recStatus.textContent = 'Microphone access denied: ' + e.message;
       return;
     }
 
@@ -397,17 +449,23 @@ func renderAddHTML(whisperEnabled bool) string {
     mediaRecorder.onstop = async () => {
       stream.getTracks().forEach(t => t.stop());
       btn.textContent = 'Record voice note';
-      status.textContent = 'Transcribing…';
 
       const blob = new Blob(chunks, { type: mediaRecorder.mimeType || 'audio/webm' });
 
-      // Show local preview while waiting for transcription.
-      const url = URL.createObjectURL(blob);
-      player.innerHTML = '<audio controls src="' + url + '"></audio>';
+      // Show local preview immediately.
+      const localUrl = URL.createObjectURL(blob);
+      player.innerHTML = '<audio controls src="' + localUrl + '"></audio>';
       player.style.display = '';
 
+      if (whisperEnabled) {
+        recStatus.textContent = 'Transcribing…';
+      } else {
+        recStatus.textContent = 'Saving…';
+      }
+
       try {
-        const res = await fetch('/transcribe', {
+        const endpoint = whisperEnabled ? '/transcribe' : '/transcribe?no_transcribe=1';
+        const res = await fetch(endpoint, {
           method: 'POST',
           headers: { 'Content-Type': blob.type || 'audio/webm' },
           body: blob,
@@ -416,43 +474,29 @@ func renderAddHTML(whisperEnabled bool) string {
 
         if (data.filename) {
           voiceField.value = data.filename;
-          // Replace local blob URL with server URL for the saved file.
           player.innerHTML = '<audio controls src="/attachment?name=' + encodeURIComponent(data.filename) + '"></audio>';
         }
 
         if (data.error) {
-          status.textContent = 'Transcription error: ' + data.error;
+          recStatus.textContent = 'Transcription error: ' + data.error;
         } else if (data.text) {
           const prefix = '\n\n---\n\u{1F3A4} **Голосовая заметка:**\n';
           textarea.value += prefix + data.text;
-          status.textContent = 'Transcribed.';
+          recStatus.textContent = 'Transcribed.';
         } else {
-          status.textContent = 'Recording saved (no transcription).';
+          recStatus.textContent = 'Recording saved.';
         }
       } catch (e) {
-        status.textContent = 'Upload error: ' + e.message;
+        recStatus.textContent = 'Upload error: ' + e.message;
       }
     };
 
     mediaRecorder.start();
     btn.textContent = 'Stop recording';
-    status.textContent = 'Recording…';
+    recStatus.textContent = 'Recording…';
   });
 })();
 </script>`
-	}
-
-	return `<h1>Add task</h1>
-<form id="task-form" action="/add_submit" method="post" enctype="multipart/form-data">
-  <div class="row">
-    <button type="submit">Save</button>
-    <button type="button" onclick="location.href='/view'">Cancel</button>
-  </div>
-  <p class="muted">` + hint + `</p>
-  <p><textarea name="text" id="task-text" placeholder="Write task in Markdown..."></textarea></p>
-  <p><label>Attachment: <input type="file" name="attachment" accept="image/*,audio/*" /></label></p>
-  <input type="hidden" name="voice_attachment" id="voice-attachment-name" value="">` + recSection + `
-</form>`
 }
 
 func renderManageHTML(tasks []queue.Task) string {
@@ -597,8 +641,25 @@ func renderManageHTML(tasks []queue.Task) string {
             panel.innerHTML =
                 '<div class="preview-bar">' +
                   '<button onclick="enterEdit()">Edit</button>' +
+                  '<button onclick="taskAction(\'done\')">Done</button>' +
+                  '<button onclick="taskAction(\'delete\')" style="color:#c00">Delete</button>' +
                 '</div>' +
                 '<div id="preview-content">' + html + '</div>';
+        }
+
+        async function taskAction(action) {
+            if (action === 'delete' && !confirm('Delete this task?')) return;
+            try {
+                const res = await fetch('/task_action', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({id: currentId, action})
+                });
+                if (!res.ok) throw new Error(await res.text());
+                location.reload();
+            } catch (err) {
+                setStatus('Error: ' + err.message);
+            }
         }
 
         async function enterEdit() {
@@ -613,15 +674,51 @@ func renderManageHTML(tasks []queue.Task) string {
             }
         }
 
+        let editAttachFilename = '';
+        let editAttachType = '';
+
         function showEdit(text) {
+            editAttachFilename = '';
+            editAttachType = '';
             panel.innerHTML =
                 '<div class="preview-bar">' +
                   '<button class="primary" onclick="saveEdit()">Save</button>' +
                   '<button onclick="cancelEdit()">Cancel</button>' +
                   '<span id="edit-status" class="muted" style="margin-left:6px"></span>' +
                 '</div>' +
-                '<textarea class="edit-area" id="edit-ta">' + escHTML(text) + '</textarea>';
-            document.getElementById('edit-ta').focus();
+                '<textarea class="edit-area" id="edit-ta">' + escHTML(text) + '</textarea>' +
+                '<div id="edit-paste-hint" class="hint" style="margin-top:6px">Paste image (Ctrl+V / ⌘V) to attach</div>' +
+                '<div id="edit-attach-preview" style="margin-top:8px"></div>';
+            const ta = document.getElementById('edit-ta');
+            ta.focus();
+            ta.addEventListener('paste', handleEditPaste);
+        }
+
+        async function handleEditPaste(e) {
+            const items = [...(e.clipboardData?.items || [])];
+            const imgItem = items.find(i => i.type.startsWith('image/'));
+            if (!imgItem) return;
+            e.preventDefault();
+            const file = imgItem.getAsFile();
+            const status = document.getElementById('edit-status');
+            status.textContent = 'Uploading image…';
+            try {
+                const res = await fetch('/attachment_upload', {
+                    method: 'POST',
+                    headers: {'Content-Type': file.type},
+                    body: file,
+                });
+                if (!res.ok) throw new Error(await res.text());
+                const data = await res.json();
+                editAttachFilename = data.filename;
+                editAttachType = data.type;
+                const preview = document.getElementById('edit-attach-preview');
+                preview.innerHTML = '<img src="/attachment?name=' + encodeURIComponent(data.filename) + '" style="max-height:120px;border-radius:6px;border:1px solid #ddd">';
+                document.getElementById('edit-paste-hint').textContent = 'Image attached (paste again to replace)';
+                status.textContent = '';
+            } catch (err) {
+                status.textContent = 'Upload error: ' + err.message;
+            }
         }
 
         async function saveEdit() {
@@ -629,10 +726,15 @@ func renderManageHTML(tasks []queue.Task) string {
             const s = document.getElementById('edit-status');
             s.textContent = 'Saving…';
             try {
+                const body = {id: currentId, text};
+                if (editAttachFilename) {
+                    body.attachment_filename = editAttachFilename;
+                    body.attachment_type = editAttachType;
+                }
                 const res = await fetch('/task_update', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({id: currentId, text})
+                    body: JSON.stringify(body)
                 });
                 if (!res.ok) throw new Error(await res.text());
                 // update list item label
@@ -733,8 +835,10 @@ func (s *Server) handleTaskUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		ID   string `json:"id"`
-		Text string `json:"text"`
+		ID                 string `json:"id"`
+		Text               string `json:"text"`
+		AttachmentFilename string `json:"attachment_filename"`
+		AttachmentType     string `json:"attachment_type"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "bad json", http.StatusBadRequest)
@@ -744,12 +848,103 @@ func (s *Server) handleTaskUpdate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "id required", http.StatusBadRequest)
 		return
 	}
+
+	if req.AttachmentFilename != "" &&
+		!strings.Contains(req.AttachmentFilename, "/") &&
+		!strings.Contains(req.AttachmentFilename, "\\") &&
+		!strings.Contains(req.AttachmentFilename, "..") {
+		candidate := filepath.Join(s.q.AttachmentsDir(), req.AttachmentFilename)
+		inside, err := util.IsPathInsideDir(candidate, s.q.AttachmentsDir())
+		if err == nil && inside {
+			if _, err := os.Stat(candidate); err == nil {
+				at := queue.AttachmentImage
+				if req.AttachmentType == "audio" {
+					at = queue.AttachmentAudio
+				}
+				if err := s.q.UpdateTask(req.ID, req.Text, candidate, at); err != nil {
+					http.Error(w, err.Error(), http.StatusInternalServerError)
+					return
+				}
+				w.Header().Set("Content-Type", "application/json; charset=utf-8")
+				io.WriteString(w, `{"ok":true}`)
+				return
+			}
+		}
+	}
+
 	if err := s.q.UpdateText(req.ID, req.Text); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	io.WriteString(w, `{"ok":true}`)
+}
+
+func (s *Server) handleTaskAction(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		ID     string `json:"id"`
+		Action string `json:"action"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad json", http.StatusBadRequest)
+		return
+	}
+	switch req.Action {
+	case "done":
+		if _, err := s.q.CompleteByID(req.ID); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+	case "delete":
+		if err := s.q.DeleteByID(req.ID); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+	default:
+		http.Error(w, "unknown action", http.StatusBadRequest)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	io.WriteString(w, `{"ok":true}`)
+}
+
+func (s *Server) handleAttachmentUpload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 64<<20)
+	ct := r.Header.Get("Content-Type")
+	ext := ".png"
+	switch {
+	case strings.Contains(ct, "jpeg"):
+		ext = ".jpg"
+	case strings.Contains(ct, "gif"):
+		ext = ".gif"
+	case strings.Contains(ct, "webp"):
+		ext = ".webp"
+	}
+	fn := fmt.Sprintf("%d%s", time.Now().UnixNano(), ext)
+	path := filepath.Join(s.q.AttachmentsDir(), fn)
+	out, err := os.Create(path)
+	if err != nil {
+		http.Error(w, "cannot create file: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if _, err := io.Copy(out, r.Body); err != nil {
+		out.Close()
+		os.Remove(path)
+		http.Error(w, "write error: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	out.Close()
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	data, _ := json.Marshal(map[string]string{"filename": fn, "type": "image"})
+	w.Write(data)
 }
 
 // handleTranscribe receives a raw audio blob, saves it, transcribes with whisper,
@@ -788,6 +983,13 @@ func (s *Server) handleTranscribe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	out.Close()
+
+	if r.URL.Query().Get("no_transcribe") == "1" {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		data, _ := json.Marshal(map[string]string{"filename": fn})
+		w.Write(data)
+		return
+	}
 
 	text, err := transcribeAudio(audioPath)
 	if err != nil {
@@ -1324,6 +1526,89 @@ func renderSettingsHTML(cfg hotkeys.KeyConfig) string {
 })();
 </script>`)
 
+	// ── Updates section ───────────────────────────────────────────────────
+	b.WriteString(`<h2 style="font-size:16px;margin:28px 0 10px">Updates</h2>`)
+	b.WriteString(fmt.Sprintf(`<p class="muted" style="margin:0 0 10px">Current version: <strong>%s</strong></p>`, esc(updater.Version)))
+	b.WriteString(`<div class="row" style="align-items:center">
+  <button id="check-update-btn">Check for updates</button>
+  <span id="update-status" class="muted"></span>
+</div>
+<div id="update-action" style="margin-top:10px"></div>
+<script>
+(function(){
+  const checkBtn = document.getElementById('check-update-btn');
+  const updateStatus = document.getElementById('update-status');
+  const updateAction = document.getElementById('update-action');
+
+  async function fetchStatus() {
+    const res = await fetch('/update/check');
+    if (!res.ok) throw new Error(await res.text());
+    return res.json();
+  }
+
+  function renderState(data) {
+    if (data.error) {
+      updateStatus.textContent = 'Check failed: ' + data.error;
+      return;
+    }
+    if (data.available) {
+      updateStatus.textContent = 'Update available: ' + data.new_version;
+      let html = '<button id="install-btn" style="background:#1a73e8;color:#fff;border-color:#1a73e8">Install ' + data.new_version + ' and restart</button>';
+      if (data.page_url) html += ' <a href="' + data.page_url + '" target="_blank" style="font-size:13px;margin-left:8px">Release notes</a>';
+      if (!data.download_url) html += '<p class="muted" style="margin:6px 0 0">No binary for this platform — install manually from the link above.</p>';
+      updateAction.innerHTML = html;
+      const installBtn = document.getElementById('install-btn');
+      if (installBtn && !data.download_url) installBtn.disabled = true;
+      if (installBtn) installBtn.addEventListener('click', installUpdate);
+    } else if (data.checked_at) {
+      updateStatus.textContent = 'Up to date (checked ' + data.checked_at + ')';
+      updateAction.innerHTML = '';
+    }
+  }
+
+  async function installUpdate() {
+    updateStatus.textContent = 'Downloading and installing…';
+    updateAction.innerHTML = '';
+    try {
+      const res = await fetch('/update/install', {method: 'POST'});
+      if (!res.ok) throw new Error(await res.text());
+      updateStatus.textContent = 'Done! Restarting…';
+    } catch (err) {
+      updateStatus.textContent = 'Install error: ' + err.message;
+    }
+  }
+
+  // Load initial state (may already be cached from background check).
+  fetchStatus().then(renderState).catch(() => {});
+
+  checkBtn.addEventListener('click', async () => {
+    checkBtn.disabled = true;
+    updateStatus.textContent = 'Checking…';
+    updateAction.innerHTML = '';
+    try {
+      await fetch('/update/check', {method: 'POST'}); // trigger background check
+      // Poll for a few seconds until the check completes.
+      let attempts = 0;
+      const poll = setInterval(async () => {
+        attempts++;
+        try {
+          const data = await fetchStatus();
+          if (data.checked_at || data.error) {
+            clearInterval(poll);
+            checkBtn.disabled = false;
+            renderState(data);
+          }
+        } catch(_) {}
+        if (attempts > 15) { clearInterval(poll); checkBtn.disabled = false; }
+      }, 700);
+    } catch (err) {
+      updateStatus.textContent = 'Error: ' + err.message;
+      checkBtn.disabled = false;
+    }
+  });
+})();
+</script>`)
+
 	return b.String()
 }
 
@@ -1534,4 +1819,76 @@ if (clearBtn) {
 
 func OpenBrowser(url string) error {
 	return util.OpenBrowser(url)
+}
+
+// ── Update handlers ───────────────────────────────────────────────────────────
+
+func (s *Server) handleUpdateCheck(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodPost {
+		// Force a fresh check in the background and return immediately.
+		go func() {
+			info, err := updater.Check()
+			s.SetUpdateInfo(info, err)
+		}()
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		io.WriteString(w, `{"ok":true,"checking":true}`)
+		return
+	}
+	// GET: return current cached state.
+	s.updateMu.Lock()
+	info := s.latestUpdate
+	checkErr := s.updateErr
+	checked := s.updateChecked
+	s.updateMu.Unlock()
+
+	type resp struct {
+		Version     string `json:"version"`
+		Available   bool   `json:"available"`
+		NewVersion  string `json:"new_version,omitempty"`
+		DownloadURL string `json:"download_url,omitempty"`
+		PageURL     string `json:"page_url,omitempty"`
+		Error       string `json:"error,omitempty"`
+		CheckedAt   string `json:"checked_at,omitempty"`
+	}
+	res := resp{Version: updater.Version}
+	if checkErr != nil {
+		res.Error = checkErr.Error()
+	}
+	if info != nil {
+		res.Available = true
+		res.NewVersion = info.Version
+		res.DownloadURL = info.DownloadURL
+		res.PageURL = info.PageURL
+	}
+	if !checked.IsZero() {
+		res.CheckedAt = checked.Format("15:04:05")
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	data, _ := json.Marshal(res)
+	w.Write(data)
+}
+
+func (s *Server) handleUpdateInstall(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	s.updateMu.Lock()
+	info := s.latestUpdate
+	s.updateMu.Unlock()
+	if info == nil {
+		http.Error(w, "no update available", http.StatusBadRequest)
+		return
+	}
+	if err := updater.Install(info); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	io.WriteString(w, `{"ok":true,"restarting":true}`)
+	// Quit after sending the response.
+	go func() {
+		time.Sleep(500 * time.Millisecond)
+		os.Exit(0)
+	}()
 }
