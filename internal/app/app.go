@@ -208,12 +208,12 @@ func onReady() {
 			mDone = systray.AddMenuItem("Done", "Complete current task")
 			items = []*systray.MenuItem{mSkip, mDone}
 		case "navigation":
-			mAddQuick = systray.AddMenuItem("Add task…", "Quick add")
-			mAddAdvanced = systray.AddMenuItem("Add task (advanced)…", "Open advanced editor in browser")
-			mQueue = systray.AddMenuItem("All tasks…", "View and manage all tasks")
+			mAddQuick = systray.AddMenuItem("Add task", "Quick add")
+			mAddAdvanced = systray.AddMenuItem("Add task (advanced)", "Open advanced editor in browser")
+			mQueue = systray.AddMenuItem("All tasks", "View and manage all tasks")
 			items = []*systray.MenuItem{mAddQuick, mAddAdvanced, mQueue}
 		case "system":
-			mSettings = systray.AddMenuItem("Settings…", "Configure hotkeys")
+			mSettings = systray.AddMenuItem("Settings", "Configure hotkeys")
 			mQuit = systray.AddMenuItem("Quit", "Quit")
 			items = []*systray.MenuItem{mSettings, mQuit}
 		}
