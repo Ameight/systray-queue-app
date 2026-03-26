@@ -525,8 +525,11 @@ func renderManageHTML(tasks []queue.Task) string {
         button.primary{background:#1a73e8;color:#fff;border-color:#1a73e8}
         button.primary:hover{background:#1558b0}
         #status{font-size:12px;color:#666}
-        .main{display:flex;gap:16px;flex:1;min-height:0}
+        .main{display:flex;gap:0;flex:1;min-height:0}
         .left-panel{width:320px;flex-shrink:0;display:flex;flex-direction:column;min-height:0}
+        .resizer{width:9px;cursor:col-resize;flex-shrink:0;position:relative;margin:0 4px}
+        .resizer::after{content:'';position:absolute;top:0;bottom:0;left:4px;width:1px;background:#ddd;border-radius:1px}
+        .resizer:hover::after,.resizer.active::after{background:#aaa}
         .right-panel{flex:1;border:1px solid #ddd;border-radius:12px;overflow:auto;padding:16px;background:#fafafa;min-width:0}
         ul{list-style:none;padding:0;margin:0;border:1px solid #ddd;border-radius:12px;overflow-y:auto;flex:1}
         li{padding:10px 12px;border-bottom:1px solid #eee;cursor:grab;background:#fff;user-select:none;font-size:14px}
@@ -547,7 +550,7 @@ func renderManageHTML(tasks []queue.Task) string {
         audio{width:100%;margin:8px 0}
     </style></head><body>`)
 	b.WriteString(`<h1>Manage queue</h1>`)
-	b.WriteString(`<div class="row"><button id="save">Save order</button><button onclick="location.href='/add'">Add</button><button onclick="location.href='/view'">View</button><button onclick="location.href='/history'">History</button><button onclick="location.href='/settings'">Settings</button><span id="status"></span></div>`)
+	b.WriteString(`<div class="row"><button id="save">Save order</button><button onclick="location.href='/add'">Add</button><button onclick="location.href='/history'">History</button><button onclick="location.href='/settings'">Settings</button><span id="status"></span></div>`)
 	b.WriteString(`<div class="main">`)
 	b.WriteString(`<div class="left-panel">`)
 	b.WriteString(`<ul id="list">`)
@@ -564,6 +567,7 @@ func renderManageHTML(tasks []queue.Task) string {
 	b.WriteString(`</ul>`)
 	b.WriteString(`<div class="hint">Drag to reorder · Click to preview</div>`)
 	b.WriteString(`</div>`)
+	b.WriteString(`<div id="resizer" class="resizer"></div>`)
 	b.WriteString(`<div class="right-panel" id="preview-panel"><div class="empty-hint">← Click a task to preview it</div></div>`)
 	b.WriteString(`</div>`)
 	b.WriteString(`<script>
@@ -760,6 +764,33 @@ func renderManageHTML(tasks []queue.Task) string {
             } catch(_) {}
             panel.innerHTML = '<div class="empty-hint">← Click a task to preview it</div>';
         }
+
+        // ── Resizable left panel ─────────────────────────────────────────────
+        const leftPanel = document.querySelector('.left-panel');
+        const resizer = document.getElementById('resizer');
+        let isResizing = false;
+        resizer.addEventListener('mousedown', (e) => {
+            isResizing = true;
+            resizer.classList.add('active');
+            document.body.style.cursor = 'col-resize';
+            document.body.style.userSelect = 'none';
+            e.preventDefault();
+        });
+        document.addEventListener('mousemove', (e) => {
+            if (!isResizing) return;
+            const mainRect = document.querySelector('.main').getBoundingClientRect();
+            const newWidth = e.clientX - mainRect.left;
+            if (newWidth >= 150 && newWidth <= mainRect.width - 200) {
+                leftPanel.style.width = newWidth + 'px';
+            }
+        });
+        document.addEventListener('mouseup', () => {
+            if (!isResizing) return;
+            isResizing = false;
+            resizer.classList.remove('active');
+            document.body.style.cursor = '';
+            document.body.style.userSelect = '';
+        });
 
         // ── Save order ───────────────────────────────────────────────────────
         document.getElementById('save').addEventListener('click', async () => {

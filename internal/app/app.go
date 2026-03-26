@@ -182,8 +182,7 @@ func onReady() {
 		mDone        *systray.MenuItem
 		mAddQuick    *systray.MenuItem
 		mAddAdvanced *systray.MenuItem
-		mView        *systray.MenuItem
-		mManage      *systray.MenuItem
+		mQueue       *systray.MenuItem
 		mSettings    *systray.MenuItem
 		mQuit        *systray.MenuItem
 	)
@@ -211,9 +210,8 @@ func onReady() {
 		case "navigation":
 			mAddQuick = systray.AddMenuItem("Add task…", "Quick add")
 			mAddAdvanced = systray.AddMenuItem("Add task (advanced)…", "Open advanced editor in browser")
-			mView = systray.AddMenuItem("View current task…", "Open current task in browser")
-			mManage = systray.AddMenuItem("Manage order…", "Reorder tasks")
-			items = []*systray.MenuItem{mAddQuick, mAddAdvanced, mView, mManage}
+			mQueue = systray.AddMenuItem("All tasks…", "View and manage all tasks")
+			items = []*systray.MenuItem{mAddQuick, mAddAdvanced, mQueue}
 		case "system":
 			mSettings = systray.AddMenuItem("Settings…", "Configure hotkeys")
 			mQuit = systray.AddMenuItem("Quit", "Quit")
@@ -352,7 +350,7 @@ func onReady() {
 	// ── Hotkeys ───────────────────────────────────────────────────────────
 
 	actions := map[string]func(){
-		hotkeys.ActionShowFirst:        func() { _ = openURL("/view") },
+		hotkeys.ActionShowFirst:        func() { _ = openURL("/") },
 		hotkeys.ActionAddQuick:         quickAdd,
 		hotkeys.ActionManageQueue:      func() { _ = openURL("/") },
 		hotkeys.ActionAddFromClipboard: func() { _ = openURL("/add") },
@@ -366,9 +364,6 @@ func onReady() {
 		action string
 	}
 	hotkeyMenuItems := []menuItem{}
-	if mView != nil {
-		hotkeyMenuItems = append(hotkeyMenuItems, menuItem{mView, "Open current task in browser", hotkeys.ActionShowFirst})
-	}
 	if mAddQuick != nil {
 		hotkeyMenuItems = append(hotkeyMenuItems, menuItem{mAddQuick, "Quick add", hotkeys.ActionAddQuick})
 	}
@@ -381,8 +376,8 @@ func onReady() {
 	if mDone != nil {
 		hotkeyMenuItems = append(hotkeyMenuItems, menuItem{mDone, "Complete current task", hotkeys.ActionComplete})
 	}
-	if mManage != nil {
-		hotkeyMenuItems = append(hotkeyMenuItems, menuItem{mManage, "Reorder tasks", hotkeys.ActionManageQueue})
+	if mQueue != nil {
+		hotkeyMenuItems = append(hotkeyMenuItems, menuItem{mQueue, "View and manage all tasks", hotkeys.ActionManageQueue})
 	}
 
 	applyTooltips := func(c hotkeys.KeyConfig) {
@@ -486,14 +481,13 @@ func onReady() {
 				}
 			}
 
-			add(mTaskTitle, func() { _ = openURL("/view") })
+			add(mTaskTitle, func() { _ = openURL("/") })
 			add(mTimer, func() { timerToggle(); refreshAll() })
 			add(mSkip, func() { _ = q.Skip(); refreshAll() })
 			add(mDone, func() { _, _ = q.Complete(); timerStop(); refreshAll() })
 			add(mAddQuick, quickAdd)
 			add(mAddAdvanced, func() { _ = openURL("/add") })
-			add(mView, func() { _ = openURL("/view") })
-			add(mManage, func() { _ = openURL("/") })
+			add(mQueue, func() { _ = openURL("/") })
 			add(mSettings, func() { _ = openURL("/settings") })
 
 			// select requires static cases — fall back to individual goroutines
@@ -515,7 +509,7 @@ func onReady() {
 		for {
 			select {
 			case <-ch(mTaskTitle):
-				_ = openURL("/view")
+				_ = openURL("/")
 			case <-ch(mTimer):
 				timerToggle()
 				refreshAll()
@@ -530,9 +524,7 @@ func onReady() {
 				quickAdd()
 			case <-ch(mAddAdvanced):
 				_ = openURL("/add")
-			case <-ch(mView):
-				_ = openURL("/view")
-			case <-ch(mManage):
+			case <-ch(mQueue):
 				_ = openURL("/")
 			case <-ch(mSettings):
 				_ = openURL("/settings")
